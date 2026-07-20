@@ -230,6 +230,29 @@ class SoundService {
     osc.stop(now + duration + 0.05);
   }
 
+  playIllegal() {
+    const ctx = this.initCtx();
+    if (!ctx) return;
+
+    const now = ctx.currentTime;
+    const duration = 0.15;
+
+    const osc = ctx.createOscillator();
+    const gain = this.createGain(ctx, duration, 0.4);
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(200, now);
+    osc.frequency.exponentialRampToValueAtTime(120, now + duration);
+
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(600, now);
+
+    osc.connect(filter);
+    filter.connect(gain);
+    osc.start(now);
+    osc.stop(now + duration + 0.02);
+  }
+
   playHover() {
     const ctx = this.initCtx();
     if (!ctx) return;
