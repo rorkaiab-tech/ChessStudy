@@ -33,10 +33,11 @@ export const ChessBoard: React.FC = () => {
   const [draggingPiece, setDraggingPiece] = useState<BoardPiece | null>(null);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
   const [dragStartPos, setDragStartPos] = useState({ x: 0, y: 0 });
+  // Correction so piece center follows cursor (not top-left)
+  const grabCorrection = useRef({ x: 0, y: 0 });
   const [rightClickStartSquare, setRightClickStartSquare] = useState<Square | null>(null);
   const [arrowPreview, setArrowPreview] = useState<{ from: Square; to: Square } | null>(null);
   const [promotionPending, setPromotionPending] = useState<{ from: Square; to: Square } | null>(null);
-  // When true, suppress piece slide animation (for drag-drop moves)
   const [suppressAnimation, setSuppressAnimation] = useState(false);
 
   const wasPointerInteraction = useRef(false);
@@ -67,7 +68,6 @@ export const ChessBoard: React.FC = () => {
       const matched: BoardPiece[] = [];
       const usedPrevIds = new Set<string>();
 
-      // Match exact position first
       newPieces.forEach((np) => {
         const prevMatch = prevPieces.find(
           (pp) => pp.square === np.square && pp.type === np.type && pp.color === np.color && !usedPrevIds.has(pp.id)
@@ -79,7 +79,6 @@ export const ChessBoard: React.FC = () => {
         }
       });
 
-      // Match moved pieces
       newPieces.forEach((np) => {
         if (np.id) return;
         if (lastMove && np.square === lastMove.to) {
@@ -195,18 +194,33 @@ export const ChessBoard: React.FC = () => {
     const moves = chess.moves({ square: piece.square, verbose: true }) as any[];
     setLegalMoves(moves.map((m) => m.to as Square));
     setDraggingPiece(piece);
+
+    // Calculate grab offset so piece center follows cursor
+    if (boardRef.current) {
+      const rect = boardRef.current.getBoundingClientRect();
+      const sqSize = rect.width / 8;
+      const coords = getSquareCoordinates(piece.square);
+      const pieceCenterX = rect.left + (coords.x + 0.5) * sqSize;
+      const pieceCenterY = rect.top + (coords.y + 0.5) * sqSize;
+      grabCorrection.current = {
+        x: e.clientX - pieceCenterX,
+        y: e.clientY - pieceCenterY,
+      };
+    }
+
     setDragStartPos({ x: e.clientX, y: e.clientY });
     setDragOffset({ x: 0, y: 0 });
 
     if (boardRef.current) boardRef.current.setPointerCapture(e.pointerId);
-  }, [promotionPending, chess, clearDrawing]);
+  }, [promotionPending, chess, clearDrawing, getSquareCoordinates]);
 
   const handleBoardPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     if (draggingPiece) {
-      const dx = e.clientX - dragStartPos.x;
-      const dy = e.clientY - dragStartPos.y;
+      // Apply grab correction so piece center tracks cursor
+      const dx = (e.clientX - dragStartPos.x) - grabCorrection.current.x;
+      const dy = (e.clientY - dragStartPos.y) - grabCorrection.current.y;
       setDragOffset({ x: dx, y: dy });
-      if (Math.abs(dx) > 5 || Math.abs(dy) > 5) {
+      if (Math.abs(e.clientX - dragStartPos.x) > 5 || Math.abs(e.clientY - dragStartPos.y) > 5) {
         wasPointerInteraction.current = true;
       }
     } else if (rightClickStartSquare) {
@@ -228,26 +242,33 @@ export const ChessBoard: React.FC = () => {
       }
 
       const targetSq = getSquareFromPosition(e.clientX, e.clientY);
-      const wasDragged = Math.abs(dragOffset.x) > 10 || Math.abs(dragOffset.y) > 10;
+      const rawDx = e.clientX - dragStartPos.x;
+      const rawDy = e.clientY - dragStartPos.y;
+      const wasDragged = Math.abs(rawDx) > 10 || Math.abs(rawDy) > 10;
 
       if (wasDragged && targetSq && targetSq !== draggingPiece.square && legalMoves.includes(targetSq)) {
-        // Drag-move: suppress animation so piece teleports to destination
+        // Legal drag-move: teleport to destination
         setSuppressAnimation(true);
         setDraggingPiece(null);
         setDragOffset({ x: 0, y: 0 });
         handleMove(draggingPiece.square, targetSq);
-        // Allow animation again after the render settles
         setTimeout(() => setSuppressAnimation(false), 100);
         return;
       } else if (wasDragged) {
+        // Illegal drag: snap back instantly (suppress animation)
+        setSuppressAnimation(true);
         setSelectedSquare(null);
         setLegalMoves([]);
+        setDraggingPiece(null);
+        setDragOffset({ x: 0, y: 0 });
+        setTimeout(() => setSuppressAnimation(false), 50);
+        return;
       }
 
       setDraggingPiece(null);
       setDragOffset({ x: 0, y: 0 });
     }
-  }, [draggingPiece, dragOffset, getSquareFromPosition, legalMoves, handleMove]);
+  }, [draggingPiece, dragStartPos, getSquareFromPosition, legalMoves, handleMove]);
 
   // --- CLICK HANDLER ---
 
@@ -259,11 +280,13 @@ export const ChessBoard: React.FC = () => {
       return;
     }
 
-    // Clear arrows on any left-click
     clearDrawing();
 
     if (selectedSquare && legalMoves.includes(sq) && selectedSquare !== sq) {
+      // Legal click-move: suppress animation for teleport
+      setSuppressAnimation(true);
       handleMove(selectedSquare, sq);
+      setTimeout(() => setSuppressAnimation(false), 100);
       return;
     }
 
@@ -368,9 +391,6 @@ export const ChessBoard: React.FC = () => {
     return { x1, y1, x2: x2 - (dx / len) * margin, y2: y2 - (dy / len) * margin };
   }, [getSquareCoordinates]);
 
-  // Determine if piece should animate
-  const shouldAnimatePiece = !suppressAnimation && !reducedMotion;
-
   return (
     <div className="relative w-full max-w-[700px] select-none touch-none">
       {/* Coordinates - Top */}
@@ -442,15 +462,26 @@ export const ChessBoard: React.FC = () => {
                 >
                   {highlightColor && <div className="absolute inset-0" style={{ backgroundColor: highlightColor }} />}
 
-                  {/* Legal move indicators */}
+                  {/* Legal move indicators (Lichess-style) */}
                   {legalMoves.includes(sq) && (
-                    <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-10">
+                    <div className="absolute inset-0 pointer-events-none z-10">
                       {chess.get(sq) ? (
-                        // Capture ring
-                        <div className="w-full h-full" style={{ boxShadow: 'inset 0 0 0 3.5px rgba(0,0,0,0.15)' }} />
+                        // Capture: corner triangles pointing inward
+                        <svg className="absolute inset-0 w-full h-full" viewBox="0 0 100 100" preserveAspectRatio="none">
+                          {/* Top-left corner */}
+                          <polygon points="0,0 20,0 0,20" fill="rgba(0,0,0,0.15)" />
+                          {/* Top-right corner */}
+                          <polygon points="100,0 80,0 100,20" fill="rgba(0,0,0,0.15)" />
+                          {/* Bottom-left corner */}
+                          <polygon points="0,100 20,100 0,80" fill="rgba(0,0,0,0.15)" />
+                          {/* Bottom-right corner */}
+                          <polygon points="100,100 80,100 100,80" fill="rgba(0,0,0,0.15)" />
+                        </svg>
                       ) : (
-                        // Empty dot
-                        <div className="rounded-full" style={{ width: '28%', height: '28%', backgroundColor: 'rgba(0,0,0,0.15)' }} />
+                        // Empty square: center dot
+                        <div className="absolute inset-0 flex items-center justify-center">
+                          <div className="rounded-full" style={{ width: '28%', height: '28%', backgroundColor: 'rgba(0,0,0,0.15)' }} />
+                        </div>
                       )}
                     </div>
                   )}
@@ -472,9 +503,7 @@ export const ChessBoard: React.FC = () => {
                     layoutId={reducedMotion ? undefined : piece.id}
                     transition={isDragging || suppressAnimation
                       ? { duration: 0 }
-                      : shouldAnimatePiece
-                        ? { type: 'tween', ease: 'easeInOut', duration: getSpeed() }
-                        : { duration: 0 }
+                      : { type: 'tween', ease: 'easeInOut', duration: getSpeed() }
                     }
                     className="absolute pointer-events-auto cursor-grab active:cursor-grabbing"
                     style={{
