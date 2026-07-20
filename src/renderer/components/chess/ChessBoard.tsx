@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
 import { Chess, Square } from 'chess.js';
 import { useChessStore, useSettingsStore } from '../../stores/chessStore';
 import { sound } from '../../services/soundService';
@@ -21,16 +20,9 @@ const OLIVE = 'rgba(98, 113, 53,';
 
 const Z = { SQUARE: 1, HIGHLIGHT: 100, SNAP: 105, LEGAL: 110, PIECE: 200, ARROW: 300, PROMO: 900, DRAG: 1000 } as const;
 
-const MOVE_EASE: [number, number, number, number] = [0.22, 1, 0.36, 1];
-const DRAG_THRESHOLD = 4;      // px before drag starts
-const DROP_THRESHOLD = 10;     // px to count as a drag (not click)
-const SNAP_MARGIN = 0.175;     // 65% central zone → 17.5% margin per edge
+const DRAG_THRESHOLD = 4;
+const SNAP_MARGIN = 0.175;
 const SNAPBACK_MS = 110;
-const MOVE_MS = 0; // No move animation — piece snaps instantly
-const HOVER_MS = 0.08;
-const SELECTION_MS = 70;
-const LEGAL_FADE_MS = 100;
-const PROMO_MS = 0.08;
 
 const FILES = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
 const RANKS = ['8', '7', '6', '5', '4', '3', '2', '1'];
@@ -38,7 +30,6 @@ const RANKS = ['8', '7', '6', '5', '4', '3', '2', '1'];
 // ── Component ──────────────────────────────────────────────────────────────────
 
 export const ChessBoard: React.FC = () => {
-  // Store selectors
   const currentFen = useChessStore((s) => s.currentFen);
   const lastMove = useChessStore((s) => s.lastMove);
   const boardOrientation = useChessStore((s) => s.boardOrientation);
@@ -50,7 +41,7 @@ export const ChessBoard: React.FC = () => {
   const clearDrawing = useChessStore((s) => s.clearDrawing);
   const checkPracticeMove = useChessStore((s) => s.checkPracticeMove);
   const submitQuizMove = useChessStore((s) => s.submitQuizMove);
-  const { boardTheme, showCoordinates, animationSpeed, reducedMotion } = useSettingsStore();
+  const { boardTheme, showCoordinates } = useSettingsStore();
 
   // ── DOM Refs ───────────────────────────────────────────────────────────────
 
@@ -59,7 +50,7 @@ export const ChessBoard: React.FC = () => {
   const floatingRef = useRef<HTMLDivElement>(null);
   const snapHighlightRef = useRef<HTMLDivElement>(null);
 
-  // ── Interaction Refs (fast-path, no re-renders) ────────────────────────────
+  // ── Interaction Refs ───────────────────────────────────────────────────────
 
   const phase = useRef<InteractionPhase>('idle');
   const pressStart = useRef({ x: 0, y: 0 });
@@ -69,18 +60,17 @@ export const ChessBoard: React.FC = () => {
   const skipClick = useRef(false);
   const snapbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // ── React State (triggers re-renders only when needed) ─────────────────────
+  // ── React State ────────────────────────────────────────────────────────────
 
   const [chess, setChess] = useState(new Chess(currentFen));
   const [pieces, setPieces] = useState<BoardPiece[]>([]);
   const [selectedSquare, setSelectedSquare] = useState<Square | null>(null);
   const [legalMoves, setLegalMoves] = useState<Square[]>([]);
-  const [dragSource, setDragSource] = useState<Square | null>(null); // hides original piece
+  const [dragSource, setDragSource] = useState<Square | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [promotionPending, setPromotionPending] = useState<{ from: Square; to: Square } | null>(null);
-  const [moveDuration, setMoveDuration] = useState(MOVE_MS / 1000);
 
-  // ── Sync chess.js engine ───────────────────────────────────────────────────
+  // ── Sync chess.js ──────────────────────────────────────────────────────────
 
   useEffect(() => {
     setChess(new Chess(currentFen));
@@ -101,7 +91,7 @@ export const ChessBoard: React.FC = () => {
     return () => window.removeEventListener('keydown', onKey);
   }, [flipBoard]);
 
-  // ── Piece sync with stable IDs ─────────────────────────────────────────────
+  // ── Piece sync ─────────────────────────────────────────────────────────────
 
   useEffect(() => {
     const board = chess.board();
@@ -114,20 +104,17 @@ export const ChessBoard: React.FC = () => {
       const matched: BoardPiece[] = [];
       const used = new Set<string>();
 
-      // 1. Exact position match
       next.forEach((np) => {
         const m = prev.find((pp) => pp.square === np.square && pp.type === np.type && pp.color === np.color && !used.has(pp.id));
         if (m) { np.id = m.id; matched.push(np); used.add(m.id); }
       });
 
-      // 2. Moved piece match (using lastMove)
       next.forEach((np) => {
         if (np.id) return;
         if (lastMove && np.square === lastMove.to) {
           const m = prev.find((pp) => pp.square === lastMove.from && pp.type === np.type && pp.color === np.color && !used.has(pp.id));
           if (m) { np.id = m.id; matched.push(np); used.add(m.id); return; }
         }
-        // 3. Broad match
         const m = prev.find((pp) => pp.type === np.type && pp.color === np.color && !used.has(pp.id)
           && !next.some(x => x.square === pp.square && x.type === pp.type && x.color === pp.color));
         if (m) { np.id = m.id; matched.push(np); used.add(m.id); }
@@ -156,7 +143,6 @@ export const ChessBoard: React.FC = () => {
     return (fi >= 0 && fi < 8 && ri >= 0 && ri < 8) ? (FILES[fi] + RANKS[ri]) as Square : null;
   }, [boardOrientation]);
 
-  // Snap: only returns square if cursor is in central 65%
   const snapFromClient = useCallback((cx: number, cy: number): Square | null => {
     if (!boardRef.current) return null;
     const r = boardRef.current.getBoundingClientRect();
@@ -173,13 +159,13 @@ export const ChessBoard: React.FC = () => {
     return snapSquare.current;
   }, [boardOrientation]);
 
-  // ── Direct DOM helpers (sub-16ms) ──────────────────────────────────────────
+  // ── Direct DOM helpers ─────────────────────────────────────────────────────
 
   const positionFloat = useCallback((cx: number, cy: number) => {
     if (!floatingRef.current || !containerRef.current) return;
     const cr = containerRef.current.getBoundingClientRect();
     const sqW = boardRef.current ? boardRef.current.getBoundingClientRect().width / 8 : 60;
-    const half = sqW * 0.54; // 108% / 2
+    const half = sqW * 0.54;
     floatingRef.current.style.left = `${cx - cr.left - half}px`;
     floatingRef.current.style.top = `${cy - cr.top - half}px`;
   }, []);
@@ -194,15 +180,13 @@ export const ChessBoard: React.FC = () => {
     el.style.opacity = '1';
   }, [getCoords]);
 
-  // ── Selection helper ───────────────────────────────────────────────────────
+  // ── Selection ──────────────────────────────────────────────────────────────
 
   const select = useCallback((sq: Square) => {
     setSelectedSquare(sq);
     const m = chess.moves({ square: sq, verbose: true }) as any[];
     setLegalMoves(m.map((x) => x.to as Square));
   }, [chess]);
-
-  // ── Cancel everything ──────────────────────────────────────────────────────
 
   const cancelAll = useCallback(() => {
     phase.current = 'idle';
@@ -259,17 +243,13 @@ export const ChessBoard: React.FC = () => {
     skipClick.current = true;
     clearDrawing();
 
-    // If a piece is selected and this is a legal capture target → make move
     if (selectedSquare && selectedSquare !== piece.square && legalSet.current.has(piece.square)) {
-      setMoveDuration(MOVE_MS / 1000);
       tryMove(selectedSquare, piece.square);
       return;
     }
 
-    // Select this piece (instant transfer if another was selected — no flicker)
     select(piece.square);
 
-    // Enter 'pressed' phase — NOT dragging yet
     phase.current = 'pressed';
     pressPiece.current = piece;
     pressStart.current = { x: e.clientX, y: e.clientY };
@@ -279,18 +259,10 @@ export const ChessBoard: React.FC = () => {
   }, [promotionPending, selectedSquare, chess, clearDrawing, select, tryMove]);
 
   const onPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
-    // Right-click arrow preview
-    if (phase.current === 'idle' && !pressPiece.current) {
-      // handled by mouse events
-      return;
-    }
-
     if (phase.current === 'pressed' && pressPiece.current) {
       const dx = e.clientX - pressStart.current.x;
       const dy = e.clientY - pressStart.current.y;
-
       if (Math.abs(dx) > DRAG_THRESHOLD || Math.abs(dy) > DRAG_THRESHOLD) {
-        // Transition: pressed → dragging
         phase.current = 'dragging';
         setIsDragging(true);
         setDragSource(pressPiece.current.square);
@@ -303,7 +275,6 @@ export const ChessBoard: React.FC = () => {
       positionFloat(e.clientX, e.clientY);
       const sq = snapFromClient(e.clientX, e.clientY);
       updateSnapHL(sq);
-      return;
     }
   }, [positionFloat, snapFromClient, updateSnapHL]);
 
@@ -314,27 +285,24 @@ export const ChessBoard: React.FC = () => {
       try { boardRef.current.releasePointerCapture(e.pointerId); } catch {}
     }
 
-    // ── Drag release ──
+    // Drag release
     if (phase.current === 'dragging' && pressPiece.current) {
       const target = snapFromClient(e.clientX, e.clientY);
       const piece = pressPiece.current;
 
-      // Reset drag visuals
       phase.current = 'idle';
       setIsDragging(false);
       updateSnapHL(null);
 
       if (target && target !== piece.square && legalSet.current.has(target)) {
-        // Legal drop → commit move, piece glides to destination
         setDragSource(null);
         pressPiece.current = null;
         snapSquare.current = null;
-        setMoveDuration(MOVE_MS / 1000);
         tryMove(piece.square, target);
         return;
       }
 
-      // Illegal drop → animate floating piece back to origin, 110ms ease-out
+      // Illegal drop: snapback
       sound.playIllegal();
       if (floatingRef.current && boardRef.current && containerRef.current) {
         const bRect = boardRef.current.getBoundingClientRect();
@@ -369,18 +337,15 @@ export const ChessBoard: React.FC = () => {
       return;
     }
 
-    // ── Click release (pressed, not dragged) ──
+    // Click release
     if (phase.current === 'pressed' && pressPiece.current) {
       const piece = pressPiece.current;
       phase.current = 'idle';
       pressPiece.current = null;
-
-      // Toggle selection if clicking same piece
       if (selectedSquare === piece.square) {
         setSelectedSquare(null);
         setLegalMoves([]);
       }
-      // Otherwise selection already set from onPiecePointerDown
       return;
     }
 
@@ -388,26 +353,23 @@ export const ChessBoard: React.FC = () => {
     pressPiece.current = null;
   }, [selectedSquare, getCoords, snapFromClient, updateSnapHL, tryMove]);
 
-  // ── Square click handler (empty squares + legal targets) ───────────────────
+  // ── Square click ───────────────────────────────────────────────────────────
 
   const onSquareClick = useCallback((sq: Square) => {
     if (promotionPending) return;
     if (skipClick.current) { skipClick.current = false; return; }
     clearDrawing();
 
-    // Legal move target → execute
     if (selectedSquare && legalSet.current.has(sq) && selectedSquare !== sq) {
-      setMoveDuration(MOVE_MS / 1000);
       tryMove(selectedSquare, sq);
       return;
     }
 
-    // Empty / non-legal → deselect
     setSelectedSquare(null);
     setLegalMoves([]);
   }, [promotionPending, selectedSquare, clearDrawing, tryMove]);
 
-  // ── Right-click drawing ────────────────────────────────────────────────────
+  // ── Right-click ────────────────────────────────────────────────────────────
 
   const rcStart = useRef<Square | null>(null);
 
@@ -435,7 +397,7 @@ export const ChessBoard: React.FC = () => {
 
   const onContextMenu = useCallback((e: React.MouseEvent) => e.preventDefault(), []);
 
-  // ── Derived state ──────────────────────────────────────────────────────────
+  // ── Derived ────────────────────────────────────────────────────────────────
 
   const checkedKing = useMemo(() => {
     if (!chess.inCheck()) return null;
@@ -468,14 +430,16 @@ export const ChessBoard: React.FC = () => {
     return { x1, y1, x2: x2 - (dx / len) * m, y2: y2 - (dy / len) * m };
   }, [getCoords]);
 
-  const dragSrc = dragSource ? `./assets/pieces/${pieces.find(p => p.square === dragSource)?.color}${pieces.find(p => p.square === dragSource)?.type.toUpperCase()}.svg` : '';
+  const dragSrc = dragSource
+    ? `./assets/pieces/${pieces.find(p => p.square === dragSource)?.color}${pieces.find(p => p.square === dragSource)?.type.toUpperCase()}.svg`
+    : '';
 
   // ── Render ─────────────────────────────────────────────────────────────────
 
   return (
     <div ref={containerRef} className="relative w-full max-w-[700px] select-none touch-none">
 
-      {/* ── Floating drag piece (OUTSIDE board — never clipped) ── */}
+      {/* Floating drag piece */}
       {isDragging && (
         <div ref={floatingRef} className="absolute pointer-events-none"
           style={{
@@ -489,7 +453,7 @@ export const ChessBoard: React.FC = () => {
         </div>
       )}
 
-      {/* ── Coordinates: Top ── */}
+      {/* Coordinates: Top */}
       {showCoordinates && (
         <div className="flex w-full mb-0.5">
           {Array.from({ length: 8 }).map((_, i) => {
@@ -500,7 +464,6 @@ export const ChessBoard: React.FC = () => {
       )}
 
       <div className="flex">
-        {/* ── Coordinates: Left ── */}
         {showCoordinates && (
           <div className="flex flex-col w-5 mr-0.5" style={{ aspectRatio: '1/8' }}>
             {Array.from({ length: 8 }).map((_, i) => {
@@ -510,7 +473,7 @@ export const ChessBoard: React.FC = () => {
           </div>
         )}
 
-        {/* ── Board ── */}
+        {/* Board */}
         <div ref={boardRef} className="relative w-full aspect-square overflow-hidden"
           style={{ cursor: phase.current === 'dragging' ? 'grabbing' : 'default' }}
           onContextMenu={onContextMenu} onMouseDown={onBgMouseDown} onMouseUp={onBgMouseUp}
@@ -539,16 +502,25 @@ export const ChessBoard: React.FC = () => {
                 <div key={idx} onClick={(e) => { e.stopPropagation(); onSquareClick(sq); }}
                   className="relative w-full h-full"
                   style={{ backgroundColor: isLight ? themeColors.light : themeColors.dark }}>
-                  {hl && <div className="absolute inset-0" style={{ backgroundColor: hl, zIndex: Z.HIGHLIGHT, transition: `background-color ${SELECTION_MS}ms` }} />}
+                  {hl && <div className="absolute inset-0" style={{ backgroundColor: hl, zIndex: Z.HIGHLIGHT }} />}
                   {isLegal && (
-                    <div className="absolute inset-0 pointer-events-none" style={{ zIndex: Z.LEGAL, transition: `opacity ${LEGAL_FADE_MS}ms` }}>
+                    <div className="absolute inset-0 pointer-events-none" style={{ zIndex: Z.LEGAL }}>
                       {hasPc ? (
+                        // Capture: olive-green ring surrounding the piece
                         <div className="absolute inset-0 flex items-center justify-center">
-                          <div style={{ width: '85%', height: '85%', borderRadius: '50%', border: `4px solid ${OLIVE} 0.7)`, boxSizing: 'border-box' }} />
+                          <div style={{
+                            width: '88%', height: '88%', borderRadius: '50%',
+                            border: `3px solid ${OLIVE} 0.55)`,
+                            boxSizing: 'border-box',
+                          }} />
                         </div>
                       ) : (
+                        // Quiet move: small centered olive-green dot
                         <div className="absolute inset-0 flex items-center justify-center">
-                          <div className="rounded-full" style={{ width: '22%', height: '22%', backgroundColor: `${OLIVE} 0.75)` }} />
+                          <div style={{
+                            width: '24%', height: '24%', borderRadius: '50%',
+                            backgroundColor: `${OLIVE} 0.65)`,
+                          }} />
                         </div>
                       )}
                     </div>
@@ -558,39 +530,33 @@ export const ChessBoard: React.FC = () => {
             })}
           </div>
 
-          {/* Snap highlight (direct DOM) */}
+          {/* Snap highlight */}
           <div ref={snapHighlightRef} className="absolute pointer-events-none"
-            style={{ zIndex: Z.SNAP, width: '12.5%', height: '12.5%', opacity: 0, backgroundColor: 'rgba(255,255,255,0.13)',
-              transition: 'left 50ms, top 50ms, opacity 50ms' }} />
+            style={{ zIndex: Z.SNAP, width: '12.5%', height: '12.5%', opacity: 0, backgroundColor: 'rgba(255,255,255,0.13)' }} />
 
-          {/* Pieces */}
+          {/* Pieces — no animation, instant positioning */}
           <div className="absolute inset-0 pointer-events-none" style={{ zIndex: Z.PIECE }}>
-            <AnimatePresence>
-              {pieces.map((piece) => {
-                const { x, y } = getCoords(piece.square);
-                const hidden = dragSource === piece.square && isDragging;
+            {pieces.map((piece) => {
+              const { x, y } = getCoords(piece.square);
+              const hidden = dragSource === piece.square && isDragging;
 
-                return (
-                  <motion.div key={piece.id}
-                    layoutId={reducedMotion ? undefined : piece.id}
-                    transition={{ duration: hidden ? 0 : moveDuration, ease: hidden ? undefined : MOVE_EASE }}
-                    className="absolute pointer-events-auto"
-                    style={{
-                      width: '12.5%', height: '12.5%',
-                      top: `${y * 12.5}%`, left: `${x * 12.5}%`,
-                      x: 0, y: 0, zIndex: Z.PIECE,
-                      opacity: hidden ? 0 : 1,
-                      cursor: phase.current === 'dragging' ? 'grabbing' : 'grab',
-                    }}
-                    whileHover={phase.current === 'idle' ? { scale: 1.02, transition: { duration: HOVER_MS } } : undefined}
-                    onPointerDown={(e) => onPiecePointerDown(e, piece)}>
-                    <img src={`./assets/pieces/${piece.color}${piece.type.toUpperCase()}.svg`}
-                      alt={`${piece.color}${piece.type}`}
-                      className="w-full h-full select-none pointer-events-none" draggable={false} />
-                  </motion.div>
-                );
-              })}
-            </AnimatePresence>
+              return (
+                <div key={piece.id}
+                  className="absolute pointer-events-auto"
+                  style={{
+                    width: '12.5%', height: '12.5%',
+                    top: `${y * 12.5}%`, left: `${x * 12.5}%`,
+                    zIndex: Z.PIECE,
+                    opacity: hidden ? 0 : 1,
+                    cursor: 'grab',
+                  }}
+                  onPointerDown={(e) => onPiecePointerDown(e, piece)}>
+                  <img src={`./assets/pieces/${piece.color}${piece.type.toUpperCase()}.svg`}
+                    alt={`${piece.color}${piece.type}`}
+                    className="w-full h-full select-none pointer-events-none" draggable={false} />
+                </div>
+              );
+            })}
           </div>
 
           {/* Arrows & Highlights */}
@@ -616,23 +582,21 @@ export const ChessBoard: React.FC = () => {
             const top = promotionPending.to[1] === '8';
             return (
               <div className="absolute inset-0" style={{ zIndex: Z.PROMO }} onClick={(e) => { e.stopPropagation(); setPromotionPending(null); }}>
-                <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} transition={{ duration: PROMO_MS, ease: 'easeOut' }}
-                  className="absolute flex flex-col rounded-md overflow-hidden shadow-xl"
+                <div className="absolute flex flex-col rounded-md overflow-hidden shadow-xl"
                   style={{ top: top ? `${co.y * 12.5 - 50}%` : `${(co.y + 1) * 12.5}%`, left: `${co.x * 12.5}%`, width: '12.5%', background: '#1a1816', border: '1px solid rgba(255,255,255,0.1)' }}
                   onClick={(e) => e.stopPropagation()}>
                   {opts.map((o) => (
                     <button key={o} onClick={() => { sound.playPromotion(); executeMove(promotionPending.from, promotionPending.to, o); }}
-                      className="hover:bg-white/15 transition-colors cursor-pointer p-1 flex items-center justify-center" style={{ aspectRatio: '1' }}>
+                      className="hover:bg-white/15 cursor-pointer p-1 flex items-center justify-center" style={{ aspectRatio: '1' }}>
                       <img src={`./assets/pieces/${color}${o.toUpperCase()}.svg`} alt={o} className="w-full h-full" />
                     </button>
                   ))}
-                </motion.div>
+                </div>
               </div>
             );
           })()}
         </div>
 
-        {/* ── Coordinates: Right ── */}
         {showCoordinates && (
           <div className="flex flex-col w-5 ml-0.5" style={{ aspectRatio: '1/8' }}>
             {Array.from({ length: 8 }).map((_, i) => {
@@ -643,7 +607,6 @@ export const ChessBoard: React.FC = () => {
         )}
       </div>
 
-      {/* ── Coordinates: Bottom ── */}
       {showCoordinates && (
         <div className="flex w-full mt-0.5">
           {Array.from({ length: 8 }).map((_, i) => {
