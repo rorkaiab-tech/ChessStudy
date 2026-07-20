@@ -37,6 +37,9 @@ export const ChessBoard: React.FC = () => {
   const [arrowPreview, setArrowPreview] = useState<{ from: Square; to: Square } | null>(null);
   const [promotionPending, setPromotionPending] = useState<{ from: Square; to: Square } | null>(null);
 
+  // Ref to track if pointer interaction was a drag — prevents click handler from firing after drag
+  const wasPointerInteraction = useRef(false);
+
   const files = useMemo(() => ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'], []);
   const ranks = useMemo(() => ['8', '7', '6', '5', '4', '3', '2', '1'], []);
 
@@ -179,47 +182,34 @@ export const ChessBoard: React.FC = () => {
     setPromotionPending(null);
   }, [chess, checkPracticeMove, submitQuizMove]);
 
-  const handleSquareClick = useCallback((sq: Square) => {
-    if (promotionPending) return;
-    if (selectedSquare === sq) {
-      clearDrawing();
-      setSelectedSquare(null);
-      setLegalMoves([]);
-      return;
-    }
-    if (legalMoves.includes(sq) && selectedSquare) {
-      handleMove(selectedSquare, sq);
-      return;
-    }
-    const piece = chess.get(sq);
-    if (piece) {
-      setSelectedSquare(sq);
-      const moves = chess.moves({ square: sq, verbose: true }) as any[];
-      setLegalMoves(moves.map((m) => m.to as Square));
-    } else {
-      clearDrawing();
-      setSelectedSquare(null);
-      setLegalMoves([]);
-    }
-  }, [promotionPending, selectedSquare, legalMoves, chess, clearDrawing, handleMove]);
+  // --- POINTER DRAG HANDLERS (on the board div) ---
 
-  // Pointer drag
-  const handlePointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>, piece: BoardPiece) => {
+  const handlePiecePointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>, piece: BoardPiece) => {
     if (e.button !== 0 || promotionPending) return;
     e.preventDefault();
+    e.stopPropagation();
+
+    wasPointerInteraction.current = false;
+
     setSelectedSquare(piece.square);
     const moves = chess.moves({ square: piece.square, verbose: true }) as any[];
     setLegalMoves(moves.map((m) => m.to as Square));
     setDraggingPiece(piece);
     setDragStartPos({ x: e.clientX, y: e.clientY });
     setDragOffset({ x: 0, y: 0 });
+
     if (boardRef.current) boardRef.current.setPointerCapture(e.pointerId);
   }, [promotionPending, chess]);
 
-  const handlePointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+  const handleBoardPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     if (draggingPiece) {
-      setDragOffset({ x: e.clientX - dragStartPos.x, y: e.clientY - dragStartPos.y });
-    } else if (rightClickStartSquare && boardRef.current) {
+      const dx = e.clientX - dragStartPos.x;
+      const dy = e.clientY - dragStartPos.y;
+      setDragOffset({ x: dx, y: dy });
+      if (Math.abs(dx) > 5 || Math.abs(dy) > 5) {
+        wasPointerInteraction.current = true;
+      }
+    } else if (rightClickStartSquare) {
       const hoverSq = getSquareFromPosition(e.clientX, e.clientY);
       if (hoverSq && hoverSq !== rightClickStartSquare) {
         setArrowPreview({ from: rightClickStartSquare, to: hoverSq });
@@ -229,26 +219,73 @@ export const ChessBoard: React.FC = () => {
     }
   }, [draggingPiece, dragStartPos, rightClickStartSquare, getSquareFromPosition]);
 
-  const handlePointerUp = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+  const handleBoardPointerUp = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+
     if (draggingPiece) {
-      if (boardRef.current) boardRef.current.releasePointerCapture(e.pointerId);
+      if (boardRef.current) {
+        try { boardRef.current.releasePointerCapture(e.pointerId); } catch {}
+      }
+
       const targetSq = getSquareFromPosition(e.clientX, e.clientY);
       const wasDragged = Math.abs(dragOffset.x) > 10 || Math.abs(dragOffset.y) > 10;
-      if (targetSq && targetSq !== draggingPiece.square && legalMoves.includes(targetSq)) {
+
+      if (wasDragged && targetSq && targetSq !== draggingPiece.square && legalMoves.includes(targetSq)) {
+        // Successful drag-move
         handleMove(draggingPiece.square, targetSq);
-      } else if (!wasDragged) {
-        // simple click handled elsewhere
-      } else {
+      } else if (wasDragged && targetSq && targetSq !== draggingPiece.square && !legalMoves.includes(targetSq)) {
+        // Dragged to illegal square — reset
         setSelectedSquare(null);
         setLegalMoves([]);
       }
+      // If not dragged far enough, it was a click — keep selection (handleSquareClick will handle it)
+
       setDraggingPiece(null);
       setDragOffset({ x: 0, y: 0 });
     }
   }, [draggingPiece, dragOffset, getSquareFromPosition, legalMoves, handleMove]);
 
-  // Right-click arrows/circles
+  // --- CLICK HANDLER (on individual squares) ---
+
+  const handleSquareClick = useCallback((sq: Square) => {
+    if (promotionPending) return;
+
+    // If a pointer interaction (drag) just happened, ignore this click
+    if (wasPointerInteraction.current) {
+      wasPointerInteraction.current = false;
+      return;
+    }
+
+    // If we have a selection and click a legal move target → make the move
+    if (selectedSquare && legalMoves.includes(sq) && selectedSquare !== sq) {
+      handleMove(selectedSquare, sq);
+      return;
+    }
+
+    // If clicking the already-selected square → deselect
+    if (selectedSquare === sq) {
+      setSelectedSquare(null);
+      setLegalMoves([]);
+      return;
+    }
+
+    // If clicking a piece → select it
+    const piece = chess.get(sq);
+    if (piece) {
+      setSelectedSquare(sq);
+      const moves = chess.moves({ square: sq, verbose: true }) as any[];
+      setLegalMoves(moves.map((m) => m.to as Square));
+    } else {
+      // Clicked empty square, no selection active → clear
+      setSelectedSquare(null);
+      setLegalMoves([]);
+    }
+  }, [promotionPending, selectedSquare, legalMoves, chess, handleMove]);
+
+  // --- RIGHT-CLICK DRAWING ---
+
   const handleContextMenu = useCallback((e: React.MouseEvent) => { e.preventDefault(); }, []);
+
   const handleBoardMouseDown = useCallback((e: React.MouseEvent) => {
     if (e.button === 2) {
       const sq = getSquareFromPosition(e.clientX, e.clientY);
@@ -273,11 +310,14 @@ export const ChessBoard: React.FC = () => {
 
   const handleBackgroundClick = useCallback((e: React.MouseEvent) => {
     if (e.button === 0) {
-      clearDrawing();
-      setSelectedSquare(null);
-      setLegalMoves([]);
+      // Only clear if the click was directly on the board background (not bubbled from a square)
+      // Square clicks call stopPropagation, so this only fires on true background clicks
+      if (!wasPointerInteraction.current) {
+        setSelectedSquare(null);
+        setLegalMoves([]);
+      }
     }
-  }, [clearDrawing]);
+  }, []);
 
   // Animation duration
   const getSpeed = useCallback(() => {
@@ -372,7 +412,8 @@ export const ChessBoard: React.FC = () => {
           onContextMenu={handleContextMenu}
           onMouseDown={handleBoardMouseDown}
           onMouseUp={handleBoardMouseUp}
-          onPointerMove={handlePointerMove}
+          onPointerMove={handleBoardPointerMove}
+          onPointerUp={handleBoardPointerUp}
           onClick={handleBackgroundClick}
         >
           {/* 1. Grid of Squares */}
@@ -441,8 +482,7 @@ export const ChessBoard: React.FC = () => {
                       y: isDragging ? dragOffset.y : 0,
                       zIndex: isDragging ? 50 : 30,
                     }}
-                    onPointerDown={(e) => handlePointerDown(e, piece)}
-                    onPointerUp={handlePointerUp}
+                    onPointerDown={(e) => handlePiecePointerDown(e, piece)}
                   >
                     <img
                       src={`./assets/pieces/${piece.color}${piece.type.toUpperCase()}.svg`}
@@ -461,9 +501,6 @@ export const ChessBoard: React.FC = () => {
             <defs>
               <marker id="arrowhead-green" markerWidth="6" markerHeight="6" refX="2" refY="3" orient="auto">
                 <path d="M0,0 L6,3 L0,6 Z" fill="rgba(98, 153, 36, 0.8)" />
-              </marker>
-              <marker id="arrowhead-red" markerWidth="6" markerHeight="6" refX="2" refY="3" orient="auto">
-                <path d="M0,0 L6,3 L0,6 Z" fill="rgba(204, 139, 44, 0.8)" />
               </marker>
             </defs>
 
