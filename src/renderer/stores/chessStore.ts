@@ -36,14 +36,14 @@ interface SettingsState {
 export const useSettingsStore = create<SettingsState>()(
   persist(
     (set) => ({
-      boardTheme: 'lichess',
+      boardTheme: 'wood',
       pieceTheme: 'cburnett',
       boardSize: 640,
       animationSpeed: 'normal',
       showCoordinates: true,
       soundVolume: 0.5,
       autoFlip: false,
-      accentColor: 'indigo',
+      accentColor: 'blue',
       highContrast: false,
       reducedMotion: false,
 
