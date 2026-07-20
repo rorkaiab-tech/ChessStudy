@@ -26,7 +26,7 @@ const DRAG_THRESHOLD = 4;      // px before drag starts
 const DROP_THRESHOLD = 10;     // px to count as a drag (not click)
 const SNAP_MARGIN = 0.175;     // 65% central zone → 17.5% margin per edge
 const SNAPBACK_MS = 110;
-const MOVE_MS = 150;
+const MOVE_MS = 0; // No move animation — piece snaps instantly
 const HOVER_MS = 0.08;
 const SELECTION_MS = 70;
 const LEGAL_FADE_MS = 100;
@@ -483,6 +483,7 @@ export const ChessBoard: React.FC = () => {
             zIndex: Z.DRAG, opacity: 1,
             filter: 'drop-shadow(0 8px 20px rgba(0,0,0,0.30))',
             willChange: 'left, top', cursor: 'grabbing',
+            transition: 'none',
           }}>
           <img src={dragSrc} alt="" className="w-full h-full select-none pointer-events-none" draggable={false} />
         </div>
