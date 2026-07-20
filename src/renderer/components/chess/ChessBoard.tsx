@@ -33,14 +33,14 @@ export const ChessBoard: React.FC = () => {
   const [draggingPiece, setDraggingPiece] = useState<BoardPiece | null>(null);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
   const [dragStartPos, setDragStartPos] = useState({ x: 0, y: 0 });
-  // Correction so piece center follows cursor (not top-left)
   const grabCorrection = useRef({ x: 0, y: 0 });
   const [rightClickStartSquare, setRightClickStartSquare] = useState<Square | null>(null);
   const [arrowPreview, setArrowPreview] = useState<{ from: Square; to: Square } | null>(null);
   const [promotionPending, setPromotionPending] = useState<{ from: Square; to: Square } | null>(null);
   const [suppressAnimation, setSuppressAnimation] = useState(false);
 
-  const wasPointerInteraction = useRef(false);
+  // Blocks handleSquareClick when piece pointer events handle the interaction
+  const skipNextClick = useRef(false);
 
   const files = useMemo(() => ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'], []);
   const ranks = useMemo(() => ['8', '7', '6', '5', '4', '3', '2', '1'], []);
@@ -72,11 +72,7 @@ export const ChessBoard: React.FC = () => {
         const prevMatch = prevPieces.find(
           (pp) => pp.square === np.square && pp.type === np.type && pp.color === np.color && !usedPrevIds.has(pp.id)
         );
-        if (prevMatch) {
-          np.id = prevMatch.id;
-          matched.push(np);
-          usedPrevIds.add(prevMatch.id);
-        }
+        if (prevMatch) { np.id = prevMatch.id; matched.push(np); usedPrevIds.add(prevMatch.id); }
       });
 
       newPieces.forEach((np) => {
@@ -85,24 +81,13 @@ export const ChessBoard: React.FC = () => {
           const prevMatch = prevPieces.find(
             (pp) => pp.square === lastMove.from && pp.type === np.type && pp.color === np.color && !usedPrevIds.has(pp.id)
           );
-          if (prevMatch) {
-            np.id = prevMatch.id;
-            matched.push(np);
-            usedPrevIds.add(prevMatch.id);
-            return;
-          }
+          if (prevMatch) { np.id = prevMatch.id; matched.push(np); usedPrevIds.add(prevMatch.id); return; }
         }
         const prevMatch = prevPieces.find(
           (pp) => pp.type === np.type && pp.color === np.color && !usedPrevIds.has(pp.id) && !newPieces.some(x => x.square === pp.square && x.type === pp.type && x.color === pp.color)
         );
-        if (prevMatch) {
-          np.id = prevMatch.id;
-          matched.push(np);
-          usedPrevIds.add(prevMatch.id);
-        } else {
-          np.id = Math.random().toString(36).substring(2, 9);
-          matched.push(np);
-        }
+        if (prevMatch) { np.id = prevMatch.id; matched.push(np); usedPrevIds.add(prevMatch.id); }
+        else { np.id = Math.random().toString(36).substring(2, 9); matched.push(np); }
       });
 
       return matched;
@@ -147,22 +132,16 @@ export const ChessBoard: React.FC = () => {
       try {
         const nextChess = new Chess(chess.fen());
         const move = nextChess.move({ from, to, promotion: promo });
-        if (move.captured || move.san.includes('x')) {
-          sound.playCapture();
-        } else if (move.san === 'O-O' || move.san === 'O-O-O') {
-          sound.playCastle();
-        } else {
-          sound.playMove();
-        }
+        if (move.captured || move.san.includes('x')) sound.playCapture();
+        else if (move.san === 'O-O' || move.san === 'O-O-O') sound.playCastle();
+        else sound.playMove();
         if (nextChess.inCheck()) sound.playCheck();
         if (nextChess.isCheckmate()) sound.playCheckmate();
         else if (nextChess.isGameOver()) sound.playSuccess();
 
         useChessStore.getState().setFen(nextChess.fen());
         useChessStore.getState().setLastMove({ from, to });
-      } catch {
-        // invalid move
-      }
+      } catch { /* invalid move */ }
     }
 
     useChessStore.getState().clearDrawing();
@@ -180,6 +159,13 @@ export const ChessBoard: React.FC = () => {
     executeMove(from, to, promotionPiece);
   }, [chess, executeMove]);
 
+  // Helper: select a piece and show its legal moves
+  const selectPiece = useCallback((sq: Square) => {
+    setSelectedSquare(sq);
+    const moves = chess.moves({ square: sq, verbose: true }) as any[];
+    setLegalMoves(moves.map((m) => m.to as Square));
+  }, [chess]);
+
   // --- POINTER HANDLERS ---
 
   const handlePiecePointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>, piece: BoardPiece) => {
@@ -187,15 +173,22 @@ export const ChessBoard: React.FC = () => {
     e.preventDefault();
     e.stopPropagation();
 
-    wasPointerInteraction.current = false;
+    // Block the click handler — pointer events will handle everything
+    skipNextClick.current = true;
     clearDrawing();
 
-    setSelectedSquare(piece.square);
-    const moves = chess.moves({ square: piece.square, verbose: true }) as any[];
-    setLegalMoves(moves.map((m) => m.to as Square));
+    // If a piece is already selected and this is a legal capture target → make the move
+    if (selectedSquare && selectedSquare !== piece.square && legalMoves.includes(piece.square)) {
+      setSuppressAnimation(true);
+      handleMove(selectedSquare, piece.square);
+      setTimeout(() => setSuppressAnimation(false), 100);
+      return;
+    }
+
+    // Select this piece and prepare for drag
+    selectPiece(piece.square);
     setDraggingPiece(piece);
 
-    // Calculate grab offset so piece center follows cursor
     if (boardRef.current) {
       const rect = boardRef.current.getBoundingClientRect();
       const sqSize = rect.width / 8;
@@ -212,24 +205,17 @@ export const ChessBoard: React.FC = () => {
     setDragOffset({ x: 0, y: 0 });
 
     if (boardRef.current) boardRef.current.setPointerCapture(e.pointerId);
-  }, [promotionPending, chess, clearDrawing, getSquareCoordinates]);
+  }, [promotionPending, selectedSquare, legalMoves, chess, clearDrawing, getSquareCoordinates, selectPiece, handleMove]);
 
   const handleBoardPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     if (draggingPiece) {
-      // Apply grab correction so piece center tracks cursor
       const dx = (e.clientX - dragStartPos.x) - grabCorrection.current.x;
       const dy = (e.clientY - dragStartPos.y) - grabCorrection.current.y;
       setDragOffset({ x: dx, y: dy });
-      if (Math.abs(e.clientX - dragStartPos.x) > 5 || Math.abs(e.clientY - dragStartPos.y) > 5) {
-        wasPointerInteraction.current = true;
-      }
     } else if (rightClickStartSquare) {
       const hoverSq = getSquareFromPosition(e.clientX, e.clientY);
-      if (hoverSq && hoverSq !== rightClickStartSquare) {
-        setArrowPreview({ from: rightClickStartSquare, to: hoverSq });
-      } else {
-        setArrowPreview(null);
-      }
+      if (hoverSq && hoverSq !== rightClickStartSquare) setArrowPreview({ from: rightClickStartSquare, to: hoverSq });
+      else setArrowPreview(null);
     }
   }, [draggingPiece, dragStartPos, rightClickStartSquare, getSquareFromPosition]);
 
@@ -247,15 +233,17 @@ export const ChessBoard: React.FC = () => {
       const wasDragged = Math.abs(rawDx) > 10 || Math.abs(rawDy) > 10;
 
       if (wasDragged && targetSq && targetSq !== draggingPiece.square && legalMoves.includes(targetSq)) {
-        // Legal drag-move: teleport to destination
+        // Legal drag-move: teleport
         setSuppressAnimation(true);
         setDraggingPiece(null);
         setDragOffset({ x: 0, y: 0 });
         handleMove(draggingPiece.square, targetSq);
         setTimeout(() => setSuppressAnimation(false), 100);
         return;
-      } else if (wasDragged) {
-        // Illegal drag: snap back instantly (suppress animation)
+      }
+
+      if (wasDragged) {
+        // Illegal drag: snap back instantly
         setSuppressAnimation(true);
         setSelectedSquare(null);
         setLegalMoves([]);
@@ -265,47 +253,44 @@ export const ChessBoard: React.FC = () => {
         return;
       }
 
+      // Not dragged = single click on piece
+      // If clicking same already-selected piece → deselect (toggle)
+      if (selectedSquare === draggingPiece.square) {
+        setSelectedSquare(null);
+        setLegalMoves([]);
+      }
+      // Otherwise selection is already set from PointerDown via selectPiece()
+
       setDraggingPiece(null);
       setDragOffset({ x: 0, y: 0 });
     }
-  }, [draggingPiece, dragStartPos, getSquareFromPosition, legalMoves, handleMove]);
+  }, [draggingPiece, dragStartPos, selectedSquare, legalMoves, getSquareFromPosition, handleMove]);
 
-  // --- CLICK HANDLER ---
+  // --- CLICK HANDLER (only for empty squares and board background) ---
 
   const handleSquareClick = useCallback((sq: Square) => {
     if (promotionPending) return;
 
-    if (wasPointerInteraction.current) {
-      wasPointerInteraction.current = false;
+    // Skip if pointer events already handled this interaction
+    if (skipNextClick.current) {
+      skipNextClick.current = false;
       return;
     }
 
     clearDrawing();
 
+    // If a piece is selected and clicking a legal move target (empty square) → make the move
     if (selectedSquare && legalMoves.includes(sq) && selectedSquare !== sq) {
-      // Legal click-move: suppress animation for teleport
       setSuppressAnimation(true);
       handleMove(selectedSquare, sq);
       setTimeout(() => setSuppressAnimation(false), 100);
       return;
     }
 
-    if (selectedSquare === sq) {
-      setSelectedSquare(null);
-      setLegalMoves([]);
-      return;
-    }
-
-    const piece = chess.get(sq);
-    if (piece) {
-      setSelectedSquare(sq);
-      const moves = chess.moves({ square: sq, verbose: true }) as any[];
-      setLegalMoves(moves.map((m) => m.to as Square));
-    } else {
-      setSelectedSquare(null);
-      setLegalMoves([]);
-    }
-  }, [promotionPending, selectedSquare, legalMoves, chess, handleMove, clearDrawing]);
+    // Clicking an empty square with no legal target → deselect
+    setSelectedSquare(null);
+    setLegalMoves([]);
+  }, [promotionPending, selectedSquare, legalMoves, handleMove, clearDrawing]);
 
   // --- RIGHT-CLICK ---
 
@@ -322,11 +307,8 @@ export const ChessBoard: React.FC = () => {
     if (e.button === 2 && rightClickStartSquare) {
       const targetSq = getSquareFromPosition(e.clientX, e.clientY);
       if (targetSq) {
-        if (rightClickStartSquare === targetSq) {
-          addCircle({ square: targetSq, color: 'red' });
-        } else {
-          addArrow({ from: rightClickStartSquare, to: targetSq, color: 'green' });
-        }
+        if (rightClickStartSquare === targetSq) addCircle({ square: targetSq, color: 'red' });
+        else addArrow({ from: rightClickStartSquare, to: targetSq, color: 'green' });
       }
       setRightClickStartSquare(null);
       setArrowPreview(null);
@@ -334,7 +316,8 @@ export const ChessBoard: React.FC = () => {
   }, [rightClickStartSquare, getSquareFromPosition, addCircle, addArrow]);
 
   const handleBackgroundClick = useCallback((e: React.MouseEvent) => {
-    if (e.button === 0 && !wasPointerInteraction.current) {
+    if (e.button === 0) {
+      if (skipNextClick.current) { skipNextClick.current = false; return; }
       clearDrawing();
       setSelectedSquare(null);
       setLegalMoves([]);
@@ -357,9 +340,7 @@ export const ChessBoard: React.FC = () => {
     for (let r = 0; r < 8; r++) {
       for (let c = 0; c < 8; c++) {
         const p = boardState[r][c];
-        if (p && p.type === 'k' && p.color === turn) {
-          return (files[c] + ranks[r]) as Square;
-        }
+        if (p && p.type === 'k' && p.color === turn) return (files[c] + ranks[r]) as Square;
       }
     }
     return null;
@@ -393,36 +374,25 @@ export const ChessBoard: React.FC = () => {
 
   return (
     <div className="relative w-full max-w-[700px] select-none touch-none">
-      {/* Coordinates - Top */}
       {showCoordinates && (
         <div className="flex w-full mb-0.5">
           {Array.from({ length: 8 }).map((_, colIdx) => {
             const fIdx = boardOrientation === 'white' ? colIdx : 7 - colIdx;
-            return (
-              <div key={colIdx} className="flex-1 text-center">
-                <span className="text-[10px] font-medium text-l-text-dim select-none">{files[fIdx]}</span>
-              </div>
-            );
+            return <div key={colIdx} className="flex-1 text-center"><span className="text-[10px] font-medium text-l-text-dim select-none">{files[fIdx]}</span></div>;
           })}
         </div>
       )}
 
       <div className="flex">
-        {/* Coordinates - Left */}
         {showCoordinates && (
           <div className="flex flex-col w-5 mr-0.5" style={{ aspectRatio: '1/8' }}>
             {Array.from({ length: 8 }).map((_, rowIdx) => {
               const rIdx = boardOrientation === 'white' ? rowIdx : 7 - rowIdx;
-              return (
-                <div key={rowIdx} className="flex-1 flex items-center justify-center">
-                  <span className="text-[10px] font-medium text-l-text-dim select-none">{ranks[rIdx]}</span>
-                </div>
-              );
+              return <div key={rowIdx} className="flex-1 flex items-center justify-center"><span className="text-[10px] font-medium text-l-text-dim select-none">{ranks[rIdx]}</span></div>;
             })}
           </div>
         )}
 
-        {/* Board */}
         <div
           ref={boardRef}
           className="relative w-full aspect-square overflow-hidden cursor-pointer"
@@ -462,23 +432,16 @@ export const ChessBoard: React.FC = () => {
                 >
                   {highlightColor && <div className="absolute inset-0" style={{ backgroundColor: highlightColor }} />}
 
-                  {/* Legal move indicators (Lichess-style) */}
                   {legalMoves.includes(sq) && (
                     <div className="absolute inset-0 pointer-events-none z-10">
                       {chess.get(sq) ? (
-                        // Capture: corner triangles pointing inward
                         <svg className="absolute inset-0 w-full h-full" viewBox="0 0 100 100" preserveAspectRatio="none">
-                          {/* Top-left corner */}
-                          <polygon points="0,0 20,0 0,20" fill="rgba(0,0,0,0.15)" />
-                          {/* Top-right corner */}
-                          <polygon points="100,0 80,0 100,20" fill="rgba(0,0,0,0.15)" />
-                          {/* Bottom-left corner */}
-                          <polygon points="0,100 20,100 0,80" fill="rgba(0,0,0,0.15)" />
-                          {/* Bottom-right corner */}
-                          <polygon points="100,100 80,100 100,80" fill="rgba(0,0,0,0.15)" />
+                          <polygon points="0,0 17,0 0,17" fill="rgba(0,0,0,0.15)" />
+                          <polygon points="100,0 83,0 100,17" fill="rgba(0,0,0,0.15)" />
+                          <polygon points="0,100 17,100 0,83" fill="rgba(0,0,0,0.15)" />
+                          <polygon points="100,100 83,100 100,83" fill="rgba(0,0,0,0.15)" />
                         </svg>
                       ) : (
-                        // Empty square: center dot
                         <div className="absolute inset-0 flex items-center justify-center">
                           <div className="rounded-full" style={{ width: '28%', height: '28%', backgroundColor: 'rgba(0,0,0,0.15)' }} />
                         </div>
@@ -532,8 +495,8 @@ export const ChessBoard: React.FC = () => {
           {/* Arrows & Circles */}
           <svg className="absolute inset-0 w-full h-full pointer-events-none z-40 fill-none" viewBox="0 0 100 100">
             <defs>
-              <marker id="arrowhead-green" markerWidth="6" markerHeight="6" refX="2" refY="3" orient="auto">
-                <path d="M0,0 L6,3 L0,6 Z" fill="rgba(98,153,36,0.8)" />
+              <marker id="arrowhead-green" markerWidth="4" markerHeight="4" refX="1.5" refY="2" orient="auto">
+                <path d="M0,0 L4,2 L0,4 Z" fill="rgba(98,153,36,0.8)" />
               </marker>
             </defs>
 
@@ -541,7 +504,7 @@ export const ChessBoard: React.FC = () => {
               const coords = getSquareCoordinates(c.square as Square);
               return (
                 <circle key={`c-${i}`} cx={(coords.x + 0.5) * 12.5} cy={(coords.y + 0.5) * 12.5}
-                  r="5.5" stroke="rgba(204,139,44,0.8)" strokeWidth="1.2" fill="none" />
+                  r="5.5" stroke="rgba(98,153,36,0.7)" strokeWidth="0.7" fill="none" />
               );
             })}
 
@@ -549,7 +512,7 @@ export const ChessBoard: React.FC = () => {
               const { x1, y1, x2, y2 } = getArrowCoords(a);
               return (
                 <line key={`a-${i}`} x1={x1} y1={y1} x2={x2} y2={y2}
-                  stroke="rgba(98,153,36,0.8)" strokeWidth="1.6" markerEnd="url(#arrowhead-green)" />
+                  stroke="rgba(98,153,36,0.8)" strokeWidth="1.3" markerEnd="url(#arrowhead-green)" />
               );
             })}
 
@@ -557,7 +520,7 @@ export const ChessBoard: React.FC = () => {
               const { x1, y1, x2, y2 } = getArrowCoords(arrowPreview);
               return (
                 <line x1={x1} y1={y1} x2={x2} y2={y2}
-                  stroke="rgba(98,153,36,0.6)" strokeWidth="1.4" markerEnd="url(#arrowhead-green)" />
+                  stroke="rgba(98,153,36,0.6)" strokeWidth="1.2" markerEnd="url(#arrowhead-green)" />
               );
             })()}
           </svg>
@@ -587,31 +550,21 @@ export const ChessBoard: React.FC = () => {
           })()}
         </div>
 
-        {/* Coordinates - Right */}
         {showCoordinates && (
           <div className="flex flex-col w-5 ml-0.5" style={{ aspectRatio: '1/8' }}>
             {Array.from({ length: 8 }).map((_, rowIdx) => {
               const rIdx = boardOrientation === 'white' ? rowIdx : 7 - rowIdx;
-              return (
-                <div key={rowIdx} className="flex-1 flex items-center justify-center">
-                  <span className="text-[10px] font-medium text-l-text-dim select-none">{ranks[rIdx]}</span>
-                </div>
-              );
+              return <div key={rowIdx} className="flex-1 flex items-center justify-center"><span className="text-[10px] font-medium text-l-text-dim select-none">{ranks[rIdx]}</span></div>;
             })}
           </div>
         )}
       </div>
 
-      {/* Coordinates - Bottom */}
       {showCoordinates && (
         <div className="flex w-full mt-0.5">
           {Array.from({ length: 8 }).map((_, colIdx) => {
             const fIdx = boardOrientation === 'white' ? colIdx : 7 - colIdx;
-            return (
-              <div key={colIdx} className="flex-1 text-center">
-                <span className="text-[10px] font-medium text-l-text-dim select-none">{files[fIdx]}</span>
-              </div>
-            );
+            return <div key={colIdx} className="flex-1 text-center"><span className="text-[10px] font-medium text-l-text-dim select-none">{files[fIdx]}</span></div>;
           })}
         </div>
       )}
