@@ -4,6 +4,8 @@ import { Chess, Square } from 'chess.js';
 import { useChessStore, useSettingsStore } from '../../stores/chessStore';
 import { sound } from '../../services/soundService';
 
+// ── Types ──────────────────────────────────────────────────────────────────────
+
 interface BoardPiece {
   id: string;
   type: 'p' | 'n' | 'b' | 'r' | 'q' | 'k';
@@ -11,23 +13,32 @@ interface BoardPiece {
   square: Square;
 }
 
+type InteractionPhase = 'idle' | 'pressed' | 'dragging';
+
+// ── Constants ──────────────────────────────────────────────────────────────────
+
 const OLIVE = 'rgba(98, 113, 53,';
 
-// Z-index layers per spec
-const Z = {
-  SQUARE: 1,
-  HIGHLIGHT: 100,
-  PIECE: 200,
-  ARROW: 300,
-  CONTEXT: 800,
-  PROMO: 900,
-  DRAG: 1000,
-} as const;
+const Z = { SQUARE: 1, HIGHLIGHT: 100, SNAP: 105, LEGAL: 110, PIECE: 200, ARROW: 300, PROMO: 900, DRAG: 1000 } as const;
 
-// Easing: cubic-bezier(0.22, 1, 0.36, 1) — accelerated start, gentle deceleration
 const MOVE_EASE: [number, number, number, number] = [0.22, 1, 0.36, 1];
+const DRAG_THRESHOLD = 4;      // px before drag starts
+const DROP_THRESHOLD = 10;     // px to count as a drag (not click)
+const SNAP_MARGIN = 0.175;     // 65% central zone → 17.5% margin per edge
+const SNAPBACK_MS = 110;
+const MOVE_MS = 150;
+const HOVER_MS = 0.08;
+const SELECTION_MS = 70;
+const LEGAL_FADE_MS = 100;
+const PROMO_MS = 0.08;
+
+const FILES = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
+const RANKS = ['8', '7', '6', '5', '4', '3', '2', '1'];
+
+// ── Component ──────────────────────────────────────────────────────────────────
 
 export const ChessBoard: React.FC = () => {
+  // Store selectors
   const currentFen = useChessStore((s) => s.currentFen);
   const lastMove = useChessStore((s) => s.lastMove);
   const boardOrientation = useChessStore((s) => s.boardOrientation);
@@ -41,31 +52,35 @@ export const ChessBoard: React.FC = () => {
   const submitQuizMove = useChessStore((s) => s.submitQuizMove);
   const { boardTheme, showCoordinates, animationSpeed, reducedMotion } = useSettingsStore();
 
+  // ── DOM Refs ───────────────────────────────────────────────────────────────
+
   const boardRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const floatingRef = useRef<HTMLDivElement>(null);
   const snapHighlightRef = useRef<HTMLDivElement>(null);
 
+  // ── Interaction Refs (fast-path, no re-renders) ────────────────────────────
+
+  const phase = useRef<InteractionPhase>('idle');
+  const pressStart = useRef({ x: 0, y: 0 });
+  const pressPiece = useRef<BoardPiece | null>(null);
+  const snapSquare = useRef<Square | null>(null);
+  const legalSet = useRef(new Set<Square>());
+  const skipClick = useRef(false);
+  const snapbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ── React State (triggers re-renders only when needed) ─────────────────────
+
   const [chess, setChess] = useState(new Chess(currentFen));
   const [pieces, setPieces] = useState<BoardPiece[]>([]);
   const [selectedSquare, setSelectedSquare] = useState<Square | null>(null);
   const [legalMoves, setLegalMoves] = useState<Square[]>([]);
-  const [draggingPiece, setDraggingPiece] = useState<BoardPiece | null>(null);
-  const dragActive = useRef(false); // true once >4px threshold
-  const dragStartPos = useRef({ x: 0, y: 0 });
-  const lastSnapSquare = useRef<Square | null>(null);
-  const [dragSourceSquare, setDragSourceSquare] = useState<Square | null>(null);
-  const [activeDropSquare, setActiveDropSquare] = useState<Square | null>(null);
-
-  const [rightClickStartSquare, setRightClickStartSquare] = useState<Square | null>(null);
-  const [arrowPreview, setArrowPreview] = useState<{ from: Square; to: Square } | null>(null);
+  const [dragSource, setDragSource] = useState<Square | null>(null); // hides original piece
+  const [isDragging, setIsDragging] = useState(false);
   const [promotionPending, setPromotionPending] = useState<{ from: Square; to: Square } | null>(null);
-  const [moveTransitionMs, setMoveTransitionMs] = useState(150);
-  const skipNextClick = useRef(false);
-  const legalSet = useRef(new Set<Square>());
+  const [moveDuration, setMoveDuration] = useState(MOVE_MS / 1000);
 
-  const files = useMemo(() => ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'], []);
-  const ranks = useMemo(() => ['8', '7', '6', '5', '4', '3', '2', '1'], []);
+  // ── Sync chess.js engine ───────────────────────────────────────────────────
 
   useEffect(() => {
     setChess(new Chess(currentFen));
@@ -75,44 +90,46 @@ export const ChessBoard: React.FC = () => {
 
   useEffect(() => { legalSet.current = new Set(legalMoves); }, [legalMoves]);
 
-  // Keyboard
+  // ── Keyboard ───────────────────────────────────────────────────────────────
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') { setSelectedSquare(null); setLegalMoves([]); setPromotionPending(null); }
+      if (e.key === 'Escape') cancelAll();
       if ((e.key === 'f' || e.key === 'F') && !e.ctrlKey && !e.metaKey) { e.preventDefault(); flipBoard(); }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [flipBoard]);
 
-  // Sync pieces
+  // ── Piece sync with stable IDs ─────────────────────────────────────────────
+
   useEffect(() => {
-    const boardState = chess.board();
-    const newPieces: BoardPiece[] = [];
-    boardState.forEach((row, rIdx) => {
-      row.forEach((col, cIdx) => {
-        if (col) {
-          const sq = (files[cIdx] + ranks[rIdx]) as Square;
-          newPieces.push({ id: '', type: col.type, color: col.color, square: sq });
-        }
-      });
-    });
+    const board = chess.board();
+    const next: BoardPiece[] = [];
+    board.forEach((row, r) => row.forEach((col, c) => {
+      if (col) next.push({ id: '', type: col.type, color: col.color, square: (FILES[c] + RANKS[r]) as Square });
+    }));
 
     setPieces((prev) => {
       const matched: BoardPiece[] = [];
       const used = new Set<string>();
 
-      newPieces.forEach((np) => {
+      // 1. Exact position match
+      next.forEach((np) => {
         const m = prev.find((pp) => pp.square === np.square && pp.type === np.type && pp.color === np.color && !used.has(pp.id));
         if (m) { np.id = m.id; matched.push(np); used.add(m.id); }
       });
-      newPieces.forEach((np) => {
+
+      // 2. Moved piece match (using lastMove)
+      next.forEach((np) => {
         if (np.id) return;
         if (lastMove && np.square === lastMove.to) {
           const m = prev.find((pp) => pp.square === lastMove.from && pp.type === np.type && pp.color === np.color && !used.has(pp.id));
           if (m) { np.id = m.id; matched.push(np); used.add(m.id); return; }
         }
-        const m = prev.find((pp) => pp.type === np.type && pp.color === np.color && !used.has(pp.id) && !newPieces.some(x => x.square === pp.square && x.type === pp.type && x.color === pp.color));
+        // 3. Broad match
+        const m = prev.find((pp) => pp.type === np.type && pp.color === np.color && !used.has(pp.id)
+          && !next.some(x => x.square === pp.square && x.type === pp.type && x.color === pp.color));
         if (m) { np.id = m.id; matched.push(np); used.add(m.id); }
         else { np.id = Math.random().toString(36).substring(2, 9); matched.push(np); }
       });
@@ -120,403 +137,411 @@ export const ChessBoard: React.FC = () => {
     });
   }, [chess]);
 
-  const getSquareCoordinates = useCallback((sq: Square) => {
-    const fIdx = files.indexOf(sq[0]);
-    const rIdx = ranks.indexOf(sq[1]);
-    return { x: boardOrientation === 'white' ? fIdx : 7 - fIdx, y: boardOrientation === 'white' ? rIdx : 7 - rIdx };
-  }, [boardOrientation, files, ranks]);
+  // ── Coordinate helpers ─────────────────────────────────────────────────────
 
-  // Standard grid detection (any point in square)
-  const getSquareFromPosition = useCallback((clientX: number, clientY: number): Square | null => {
+  const getCoords = useCallback((sq: Square) => {
+    const fi = FILES.indexOf(sq[0]);
+    const ri = RANKS.indexOf(sq[1]);
+    return { x: boardOrientation === 'white' ? fi : 7 - fi, y: boardOrientation === 'white' ? ri : 7 - ri };
+  }, [boardOrientation]);
+
+  const sqFromClient = useCallback((cx: number, cy: number): Square | null => {
     if (!boardRef.current) return null;
-    const rect = boardRef.current.getBoundingClientRect();
-    const x = clientX - rect.left;
-    const y = clientY - rect.top;
-    if (x < 0 || x > rect.width || y < 0 || y > rect.height) return null;
-    const col = Math.floor((x / rect.width) * 8);
-    const row = Math.floor((y / rect.height) * 8);
-    const fIdx = boardOrientation === 'white' ? col : 7 - col;
-    const rIdx = boardOrientation === 'white' ? row : 7 - row;
-    if (fIdx >= 0 && fIdx < 8 && rIdx >= 0 && rIdx < 8) return (files[fIdx] + ranks[rIdx]) as Square;
-    return null;
-  }, [boardOrientation, files, ranks]);
+    const r = boardRef.current.getBoundingClientRect();
+    const rx = cx - r.left, ry = cy - r.top;
+    if (rx < 0 || rx > r.width || ry < 0 || ry > r.height) return null;
+    const col = Math.floor(rx / r.width * 8), row = Math.floor(ry / r.height * 8);
+    const fi = boardOrientation === 'white' ? col : 7 - col;
+    const ri = boardOrientation === 'white' ? row : 7 - row;
+    return (fi >= 0 && fi < 8 && ri >= 0 && ri < 8) ? (FILES[fi] + RANKS[ri]) as Square : null;
+  }, [boardOrientation]);
 
-  // Snap detection: only returns square if cursor is in central 65% of it
-  const getSnapSquare = useCallback((clientX: number, clientY: number): Square | null => {
+  // Snap: only returns square if cursor is in central 65%
+  const snapFromClient = useCallback((cx: number, cy: number): Square | null => {
     if (!boardRef.current) return null;
-    const rect = boardRef.current.getBoundingClientRect();
-    const x = clientX - rect.left;
-    const y = clientY - rect.top;
-    if (x < 0 || x > rect.width || y < 0 || y > rect.height) return null;
-
-    const sqSize = rect.width / 8;
-    const col = Math.floor(x / sqSize);
-    const row = Math.floor(y / sqSize);
+    const r = boardRef.current.getBoundingClientRect();
+    const rx = cx - r.left, ry = cy - r.top;
+    if (rx < 0 || rx > r.width || ry < 0 || ry > r.height) return null;
+    const sq = r.width / 8;
+    const col = Math.floor(rx / sq), row = Math.floor(ry / sq);
     if (col < 0 || col > 7 || row < 0 || row > 7) return null;
+    const fx = (rx - col * sq) / sq, fy = (ry - row * sq) / sq;
+    if (fx < SNAP_MARGIN || fx > 1 - SNAP_MARGIN || fy < SNAP_MARGIN || fy > 1 - SNAP_MARGIN) return snapSquare.current;
+    const fi = boardOrientation === 'white' ? col : 7 - col;
+    const ri = boardOrientation === 'white' ? row : 7 - row;
+    if (fi >= 0 && fi < 8 && ri >= 0 && ri < 8) { const s = (FILES[fi] + RANKS[ri]) as Square; snapSquare.current = s; return s; }
+    return snapSquare.current;
+  }, [boardOrientation]);
 
-    // Fractional position within the square (0..1)
-    const fracX = (x - col * sqSize) / sqSize;
-    const fracY = (y - row * sqSize) / sqSize;
+  // ── Direct DOM helpers (sub-16ms) ──────────────────────────────────────────
 
-    // Central 65% zone: margin = (1 - 0.65) / 2 = 0.175
-    const margin = 0.175;
-    if (fracX < margin || fracX > 1 - margin || fracY < margin || fracY > 1 - margin) {
-      // Cursor is near the edge — keep previous snap target (hysteresis)
-      return lastSnapSquare.current;
-    }
-
-    const fIdx = boardOrientation === 'white' ? col : 7 - col;
-    const rIdx = boardOrientation === 'white' ? row : 7 - row;
-    if (fIdx >= 0 && fIdx < 8 && rIdx >= 0 && rIdx < 8) {
-      const sq = (files[fIdx] + ranks[rIdx]) as Square;
-      lastSnapSquare.current = sq;
-      return sq;
-    }
-    return lastSnapSquare.current;
-  }, [boardOrientation, files, ranks]);
-
-  // Position floating piece via direct DOM (sub-16ms)
-  const positionFloating = useCallback((clientX: number, clientY: number) => {
+  const positionFloat = useCallback((cx: number, cy: number) => {
     if (!floatingRef.current || !containerRef.current) return;
-    const cRect = containerRef.current.getBoundingClientRect();
-    const sqSize = boardRef.current ? boardRef.current.getBoundingClientRect().width / 8 : 60;
-    const half = sqSize * 0.54; // 108% / 2
-    floatingRef.current.style.left = `${clientX - cRect.left - half}px`;
-    floatingRef.current.style.top = `${clientY - cRect.top - half}px`;
+    const cr = containerRef.current.getBoundingClientRect();
+    const sqW = boardRef.current ? boardRef.current.getBoundingClientRect().width / 8 : 60;
+    const half = sqW * 0.54; // 108% / 2
+    floatingRef.current.style.left = `${cx - cr.left - half}px`;
+    floatingRef.current.style.top = `${cy - cr.top - half}px`;
   }, []);
 
-  // Update snap highlight via direct DOM (sub-16ms, no re-render)
-  const updateSnapHighlight = useCallback((sq: Square | null) => {
-    if (!snapHighlightRef.current || !boardRef.current) return;
+  const updateSnapHL = useCallback((sq: Square | null) => {
     const el = snapHighlightRef.current;
-    if (!sq) {
-      el.style.opacity = '0';
-      return;
-    }
-    const coords = getSquareCoordinates(sq);
-    const pct = 12.5;
-    el.style.left = `${coords.x * pct}%`;
-    el.style.top = `${coords.y * pct}%`;
-    el.style.width = `${pct}%`;
-    el.style.height = `${pct}%`;
+    if (!el) return;
+    if (!sq) { el.style.opacity = '0'; return; }
+    const c = getCoords(sq);
+    el.style.left = `${c.x * 12.5}%`;
+    el.style.top = `${c.y * 12.5}%`;
     el.style.opacity = '1';
-  }, [getSquareCoordinates]);
+  }, [getCoords]);
 
-  const selectPiece = useCallback((sq: Square) => {
+  // ── Selection helper ───────────────────────────────────────────────────────
+
+  const select = useCallback((sq: Square) => {
     setSelectedSquare(sq);
-    const moves = chess.moves({ square: sq, verbose: true }) as any[];
-    setLegalMoves(moves.map((m) => m.to as Square));
+    const m = chess.moves({ square: sq, verbose: true }) as any[];
+    setLegalMoves(m.map((x) => x.to as Square));
   }, [chess]);
 
-  const executeMove = useCallback((from: Square, to: Square, promo = 'q') => {
-    const interactiveMode = useChessStore.getState().interactiveMode;
-    if (interactiveMode === 'practice') { checkPracticeMove(from, to, promo); }
-    else if (interactiveMode === 'quiz') { submitQuizMove(from, to, promo); }
-    else {
-      try {
-        const nextChess = new Chess(chess.fen());
-        const move = nextChess.move({ from, to, promotion: promo });
-        if (move.captured || move.san.includes('x')) sound.playCapture();
-        else if (move.san === 'O-O' || move.san === 'O-O-O') sound.playCastle();
-        else sound.playMove();
-        if (nextChess.inCheck()) sound.playCheck();
-        if (nextChess.isCheckmate()) sound.playCheckmate();
-        else if (nextChess.isGameOver()) sound.playSuccess();
-        useChessStore.getState().setFen(nextChess.fen());
-        useChessStore.getState().setLastMove({ from, to });
-      } catch { /* invalid */ }
-    }
-    useChessStore.getState().clearDrawing();
+  // ── Cancel everything ──────────────────────────────────────────────────────
+
+  const cancelAll = useCallback(() => {
+    phase.current = 'idle';
+    pressPiece.current = null;
+    snapSquare.current = null;
+    if (snapbackTimer.current) { clearTimeout(snapbackTimer.current); snapbackTimer.current = null; }
+    setIsDragging(false);
+    setDragSource(null);
     setSelectedSquare(null);
     setLegalMoves([]);
     setPromotionPending(null);
-  }, [chess, checkPracticeMove, submitQuizMove]);
+    updateSnapHL(null);
+  }, [updateSnapHL]);
 
-  const handleMove = useCallback((from: Square, to: Square, promotionPiece = 'q') => {
-    const piece = chess.get(from);
-    if (piece?.type === 'p' && (to[1] === '8' || to[1] === '1')) {
-      setPromotionPending({ from, to });
-      return;
+  // ── Move execution ─────────────────────────────────────────────────────────
+
+  const executeMove = useCallback((from: Square, to: Square, promo = 'q') => {
+    const mode = useChessStore.getState().interactiveMode;
+    if (mode === 'practice') { checkPracticeMove(from, to, promo); }
+    else if (mode === 'quiz') { submitQuizMove(from, to, promo); }
+    else {
+      try {
+        const next = new Chess(chess.fen());
+        const mv = next.move({ from, to, promotion: promo });
+        if (mv.captured || mv.san.includes('x')) sound.playCapture();
+        else if (mv.san === 'O-O' || mv.san === 'O-O-O') sound.playCastle();
+        else sound.playMove();
+        if (next.inCheck()) sound.playCheck();
+        if (next.isCheckmate()) sound.playCheckmate();
+        else if (next.isGameOver()) sound.playSuccess();
+        useChessStore.getState().setFen(next.fen());
+        useChessStore.getState().setLastMove({ from, to });
+      } catch { /* illegal */ }
     }
-    executeMove(from, to, promotionPiece);
+    clearDrawing();
+    setSelectedSquare(null);
+    setLegalMoves([]);
+    setPromotionPending(null);
+  }, [chess, checkPracticeMove, submitQuizMove, clearDrawing]);
+
+  const tryMove = useCallback((from: Square, to: Square, promo = 'q') => {
+    const p = chess.get(from);
+    if (p?.type === 'p' && (to[1] === '8' || to[1] === '1')) { setPromotionPending({ from, to }); return; }
+    executeMove(from, to, promo);
   }, [chess, executeMove]);
 
-  // --- POINTER ---
+  // ── Pointer handlers ───────────────────────────────────────────────────────
 
-  const handlePiecePointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>, piece: BoardPiece) => {
+  const onPiecePointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>, piece: BoardPiece) => {
     if (e.button !== 0 || promotionPending) return;
     e.preventDefault();
     e.stopPropagation();
 
-    skipNextClick.current = true;
+    skipClick.current = true;
     clearDrawing();
 
-    // Legal capture on selected piece
+    // If a piece is selected and this is a legal capture target → make move
     if (selectedSquare && selectedSquare !== piece.square && legalSet.current.has(piece.square)) {
-      setMoveTransitionMs(150);
-      handleMove(selectedSquare, piece.square);
+      setMoveDuration(MOVE_MS / 1000);
+      tryMove(selectedSquare, piece.square);
       return;
     }
 
-    // Select and prepare potential drag
-    selectPiece(piece.square);
-    setDraggingPiece(piece);
-    setDragSourceSquare(piece.square);
-    dragActive.current = false;
-    lastSnapSquare.current = null;
-    dragStartPos.current = { x: e.clientX, y: e.clientY };
-    setActiveDropSquare(null);
+    // Select this piece (instant transfer if another was selected — no flicker)
+    select(piece.square);
+
+    // Enter 'pressed' phase — NOT dragging yet
+    phase.current = 'pressed';
+    pressPiece.current = piece;
+    pressStart.current = { x: e.clientX, y: e.clientY };
+    snapSquare.current = null;
 
     if (boardRef.current) boardRef.current.setPointerCapture(e.pointerId);
-  }, [promotionPending, selectedSquare, chess, clearDrawing, selectPiece, handleMove]);
+  }, [promotionPending, selectedSquare, chess, clearDrawing, select, tryMove]);
 
-  const handleBoardPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
-    if (!draggingPiece) {
-      if (rightClickStartSquare) {
-        const hoverSq = getSquareFromPosition(e.clientX, e.clientY);
-        if (hoverSq && hoverSq !== rightClickStartSquare) setArrowPreview({ from: rightClickStartSquare, to: hoverSq });
-        else setArrowPreview(null);
+  const onPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    // Right-click arrow preview
+    if (phase.current === 'idle' && !pressPiece.current) {
+      // handled by mouse events
+      return;
+    }
+
+    if (phase.current === 'pressed' && pressPiece.current) {
+      const dx = e.clientX - pressStart.current.x;
+      const dy = e.clientY - pressStart.current.y;
+
+      if (Math.abs(dx) > DRAG_THRESHOLD || Math.abs(dy) > DRAG_THRESHOLD) {
+        // Transition: pressed → dragging
+        phase.current = 'dragging';
+        setIsDragging(true);
+        setDragSource(pressPiece.current.square);
+        positionFloat(e.clientX, e.clientY);
       }
       return;
     }
 
-    const dx = e.clientX - dragStartPos.current.x;
-    const dy = e.clientY - dragStartPos.current.y;
-
-    // 4px threshold to start drag
-    if (!dragActive.current) {
-      if (Math.abs(dx) > 4 || Math.abs(dy) > 4) {
-        dragActive.current = true;
-        // Position floating piece at cursor immediately
-        positionFloating(e.clientX, e.clientY);
-      }
+    if (phase.current === 'dragging') {
+      positionFloat(e.clientX, e.clientY);
+      const sq = snapFromClient(e.clientX, e.clientY);
+      updateSnapHL(sq);
       return;
     }
+  }, [positionFloat, snapFromClient, updateSnapHL]);
 
-    // Drag is active — update floating piece position (direct DOM, no re-render)
-    positionFloating(e.clientX, e.clientY);
-
-    // Update snap target (direct DOM, no re-render)
-    const snapSq = getSnapSquare(e.clientX, e.clientY);
-    if (snapSq !== lastSnapSquare.current) {
-      lastSnapSquare.current = snapSq;
-      updateSnapHighlight(snapSq);
-      setActiveDropSquare(snapSq); // state only for legal move indicator rendering
-    }
-  }, [draggingPiece, rightClickStartSquare, getSquareFromPosition, positionFloating, getSnapSquare, updateSnapHighlight]);
-
-  const handleBoardPointerUp = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+  const onPointerUp = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
 
-    if (draggingPiece) {
-      if (boardRef.current) {
-        try { boardRef.current.releasePointerCapture(e.pointerId); } catch {}
-      }
+    if (boardRef.current) {
+      try { boardRef.current.releasePointerCapture(e.pointerId); } catch {}
+    }
 
-      if (dragActive.current) {
-        const targetSq = getSnapSquare(e.clientX, e.clientY);
+    // ── Drag release ──
+    if (phase.current === 'dragging' && pressPiece.current) {
+      const target = snapFromClient(e.clientX, e.clientY);
+      const piece = pressPiece.current;
 
-        if (targetSq && targetSq !== draggingPiece.square && legalSet.current.has(targetSq)) {
-          // Legal drop
-          setMoveTransitionMs(150);
-          setDraggingPiece(null);
-          setDragSourceSquare(null);
-          setActiveDropSquare(null);
-          dragActive.current = false;
-          lastSnapSquare.current = null;
-          updateSnapHighlight(null);
-          handleMove(draggingPiece.square, targetSq);
-          return;
-        }
+      // Reset drag visuals
+      phase.current = 'idle';
+      setIsDragging(false);
+      updateSnapHL(null);
 
-        // Illegal drop: 110ms snapback
-        sound.playIllegal();
-        setMoveTransitionMs(110);
-        setSelectedSquare(null);
-        setLegalMoves([]);
-        setDraggingPiece(null);
-        setDragSourceSquare(null);
-        setActiveDropSquare(null);
-        dragActive.current = false;
-        lastSnapSquare.current = null;
-        updateSnapHighlight(null);
+      if (target && target !== piece.square && legalSet.current.has(target)) {
+        // Legal drop → commit move, piece glides to destination
+        setDragSource(null);
+        pressPiece.current = null;
+        snapSquare.current = null;
+        setMoveDuration(MOVE_MS / 1000);
+        tryMove(piece.square, target);
         return;
       }
 
-      // Not dragged = click on piece
-      if (selectedSquare === draggingPiece.square) {
+      // Illegal drop → animate floating piece back to origin, 110ms ease-out
+      sound.playIllegal();
+      if (floatingRef.current && boardRef.current && containerRef.current) {
+        const bRect = boardRef.current.getBoundingClientRect();
+        const cRect = containerRef.current.getBoundingClientRect();
+        const c = getCoords(piece.square);
+        const sqW = bRect.width / 8;
+        const half = sqW * 0.54;
+        const targetX = bRect.left - cRect.left + (c.x + 0.5) * sqW - half;
+        const targetY = bRect.top - cRect.top + (c.y + 0.5) * sqW - half;
+
+        const el = floatingRef.current;
+        el.style.transition = `left ${SNAPBACK_MS}ms ease-out, top ${SNAPBACK_MS}ms ease-out`;
+        el.style.left = `${targetX}px`;
+        el.style.top = `${targetY}px`;
+
+        snapbackTimer.current = setTimeout(() => {
+          el.style.transition = '';
+          setDragSource(null);
+          setSelectedSquare(null);
+          setLegalMoves([]);
+          pressPiece.current = null;
+          snapSquare.current = null;
+          snapbackTimer.current = null;
+        }, SNAPBACK_MS);
+      } else {
+        setDragSource(null);
+        setSelectedSquare(null);
+        setLegalMoves([]);
+        pressPiece.current = null;
+        snapSquare.current = null;
+      }
+      return;
+    }
+
+    // ── Click release (pressed, not dragged) ──
+    if (phase.current === 'pressed' && pressPiece.current) {
+      const piece = pressPiece.current;
+      phase.current = 'idle';
+      pressPiece.current = null;
+
+      // Toggle selection if clicking same piece
+      if (selectedSquare === piece.square) {
         setSelectedSquare(null);
         setLegalMoves([]);
       }
-
-      setDraggingPiece(null);
-      setDragSourceSquare(null);
-      setActiveDropSquare(null);
-      dragActive.current = false;
-      updateSnapHighlight(null);
-    }
-  }, [draggingPiece, selectedSquare, getSnapSquare, handleMove, updateSnapHighlight]);
-
-  // --- CLICK ---
-
-  const handleSquareClick = useCallback((sq: Square) => {
-    if (promotionPending) return;
-    if (skipNextClick.current) { skipNextClick.current = false; return; }
-    clearDrawing();
-    if (selectedSquare && legalSet.current.has(sq) && selectedSquare !== sq) {
-      setMoveTransitionMs(150);
-      handleMove(selectedSquare, sq);
+      // Otherwise selection already set from onPiecePointerDown
       return;
     }
+
+    phase.current = 'idle';
+    pressPiece.current = null;
+  }, [selectedSquare, getCoords, snapFromClient, updateSnapHL, tryMove]);
+
+  // ── Square click handler (empty squares + legal targets) ───────────────────
+
+  const onSquareClick = useCallback((sq: Square) => {
+    if (promotionPending) return;
+    if (skipClick.current) { skipClick.current = false; return; }
+    clearDrawing();
+
+    // Legal move target → execute
+    if (selectedSquare && legalSet.current.has(sq) && selectedSquare !== sq) {
+      setMoveDuration(MOVE_MS / 1000);
+      tryMove(selectedSquare, sq);
+      return;
+    }
+
+    // Empty / non-legal → deselect
     setSelectedSquare(null);
     setLegalMoves([]);
-  }, [promotionPending, selectedSquare, handleMove, clearDrawing]);
+  }, [promotionPending, selectedSquare, clearDrawing, tryMove]);
 
-  // --- RIGHT-CLICK ---
+  // ── Right-click drawing ────────────────────────────────────────────────────
 
-  const handleContextMenu = useCallback((e: React.MouseEvent) => { e.preventDefault(); }, []);
+  const rcStart = useRef<Square | null>(null);
 
-  const handleBoardMouseDown = useCallback((e: React.MouseEvent) => {
-    if (e.button === 2) { const sq = getSquareFromPosition(e.clientX, e.clientY); if (sq) setRightClickStartSquare(sq); }
-  }, [getSquareFromPosition]);
+  const onBgMouseDown = useCallback((e: React.MouseEvent) => {
+    if (e.button === 2) { const sq = sqFromClient(e.clientX, e.clientY); if (sq) rcStart.current = sq; }
+  }, [sqFromClient]);
 
-  const handleBoardMouseUp = useCallback((e: React.MouseEvent) => {
-    if (e.button === 2 && rightClickStartSquare) {
-      const targetSq = getSquareFromPosition(e.clientX, e.clientY);
-      if (targetSq) {
-        if (rightClickStartSquare === targetSq) addCircle({ square: targetSq, color: 'green' });
-        else addArrow({ from: rightClickStartSquare, to: targetSq, color: 'green' });
+  const onBgMouseUp = useCallback((e: React.MouseEvent) => {
+    if (e.button === 2 && rcStart.current) {
+      const sq = sqFromClient(e.clientX, e.clientY);
+      if (sq) {
+        if (rcStart.current === sq) addCircle({ square: sq, color: 'green' });
+        else addArrow({ from: rcStart.current, to: sq, color: 'green' });
       }
-      setRightClickStartSquare(null);
-      setArrowPreview(null);
+      rcStart.current = null;
     }
-  }, [rightClickStartSquare, getSquareFromPosition, addCircle, addArrow]);
+  }, [sqFromClient, addCircle, addArrow]);
 
-  const handleBackgroundClick = useCallback((e: React.MouseEvent) => {
+  const onBgClick = useCallback((e: React.MouseEvent) => {
     if (e.button === 0) {
-      if (skipNextClick.current) { skipNextClick.current = false; return; }
+      if (skipClick.current) { skipClick.current = false; return; }
       clearDrawing(); setSelectedSquare(null); setLegalMoves([]);
     }
   }, [clearDrawing]);
 
-  // --- HELPERS ---
+  const onContextMenu = useCallback((e: React.MouseEvent) => e.preventDefault(), []);
 
-  const effectiveDuration = moveTransitionMs / 1000;
+  // ── Derived state ──────────────────────────────────────────────────────────
 
-  const checkedKingSquare = useMemo(() => {
+  const checkedKing = useMemo(() => {
     if (!chess.inCheck()) return null;
-    const turn = chess.turn();
-    const boardState = chess.board();
+    const t = chess.turn();
+    const b = chess.board();
     for (let r = 0; r < 8; r++) for (let c = 0; c < 8; c++) {
-      const p = boardState[r][c];
-      if (p && p.type === 'k' && p.color === turn) return (files[c] + ranks[r]) as Square;
+      const p = b[r][c]; if (p && p.type === 'k' && p.color === t) return (FILES[c] + RANKS[r]) as Square;
     }
     return null;
-  }, [chess, files, ranks]);
+  }, [chess]);
 
   const themeColors = useMemo(() => {
-    const themes: Record<string, { light: string; dark: string }> = {
+    const m: Record<string, { light: string; dark: string }> = {
       lichess: { light: '#eeeed2', dark: '#769656' },
       wood: { light: '#F0D9B5', dark: '#B58863' },
       dark: { light: '#C6C6C6', dark: '#7B7B7B' },
       midnight: { light: '#C8D6E5', dark: '#576574' },
       emerald: { light: '#D4E6C3', dark: '#5A8A3C' },
     };
-    return themes[boardTheme] || themes.wood;
+    return m[boardTheme] || m.wood;
   }, [boardTheme]);
 
-  const getArrowCoords = useCallback((arrow: { from: string; to: string }) => {
-    const fc = getSquareCoordinates(arrow.from as Square);
-    const tc = getSquareCoordinates(arrow.to as Square);
-    const x1 = (fc.x + 0.5) * 12.5, y1 = (fc.y + 0.5) * 12.5;
-    const x2 = (tc.x + 0.5) * 12.5, y2 = (tc.y + 0.5) * 12.5;
+  const arrowCoords = useCallback((a: { from: string; to: string }) => {
+    const f = getCoords(a.from as Square), t = getCoords(a.to as Square);
+    const x1 = (f.x + 0.5) * 12.5, y1 = (f.y + 0.5) * 12.5;
+    const x2 = (t.x + 0.5) * 12.5, y2 = (t.y + 0.5) * 12.5;
     const dx = x2 - x1, dy = y2 - y1, len = Math.sqrt(dx * dx + dy * dy);
     if (len === 0) return { x1, y1, x2, y2 };
     const m = 5;
     return { x1, y1, x2: x2 - (dx / len) * m, y2: y2 - (dy / len) * m };
-  }, [getSquareCoordinates]);
+  }, [getCoords]);
 
-  const dragImgSrc = draggingPiece ? `./assets/pieces/${draggingPiece.color}${draggingPiece.type.toUpperCase()}.svg` : '';
+  const dragSrc = dragSource ? `./assets/pieces/${pieces.find(p => p.square === dragSource)?.color}${pieces.find(p => p.square === dragSource)?.type.toUpperCase()}.svg` : '';
+
+  // ── Render ─────────────────────────────────────────────────────────────────
 
   return (
     <div ref={containerRef} className="relative w-full max-w-[700px] select-none touch-none">
 
-      {/* Floating dragged piece — OUTSIDE board, not clipped */}
-      {draggingPiece && (
-        <div
-          ref={floatingRef}
-          className="absolute pointer-events-none"
+      {/* ── Floating drag piece (OUTSIDE board — never clipped) ── */}
+      {isDragging && (
+        <div ref={floatingRef} className="absolute pointer-events-none"
           style={{
-            width: `${100 / 8 * 1.08}%`,
-            height: `${100 / 8 * 1.08}%`,
-            zIndex: Z.DRAG,
+            width: `${100 / 8 * 1.08}%`, height: `${100 / 8 * 1.08}%`,
+            zIndex: Z.DRAG, opacity: 1,
             filter: 'drop-shadow(0 8px 20px rgba(0,0,0,0.30))',
-            opacity: dragActive.current ? 1 : 0,
-            willChange: 'left, top',
-            cursor: 'grabbing',
-          }}
-        >
-          <img src={dragImgSrc} alt="" className="w-full h-full select-none pointer-events-none" draggable={false} />
+            willChange: 'left, top', cursor: 'grabbing',
+          }}>
+          <img src={dragSrc} alt="" className="w-full h-full select-none pointer-events-none" draggable={false} />
         </div>
       )}
 
-      {/* Coordinates - Top */}
+      {/* ── Coordinates: Top ── */}
       {showCoordinates && (
         <div className="flex w-full mb-0.5">
           {Array.from({ length: 8 }).map((_, i) => {
-            const fIdx = boardOrientation === 'white' ? i : 7 - i;
-            return <div key={i} className="flex-1 text-center"><span className="text-[10px] font-medium select-none" style={{ color: 'rgba(180,180,180,0.5)' }}>{files[fIdx]}</span></div>;
+            const fi = boardOrientation === 'white' ? i : 7 - i;
+            return <div key={i} className="flex-1 text-center"><span className="text-[10px] font-medium select-none" style={{ color: 'rgba(180,180,180,0.5)' }}>{FILES[fi]}</span></div>;
           })}
         </div>
       )}
 
       <div className="flex">
+        {/* ── Coordinates: Left ── */}
         {showCoordinates && (
           <div className="flex flex-col w-5 mr-0.5" style={{ aspectRatio: '1/8' }}>
             {Array.from({ length: 8 }).map((_, i) => {
-              const rIdx = boardOrientation === 'white' ? i : 7 - i;
-              return <div key={i} className="flex-1 flex items-center justify-center"><span className="text-[10px] font-medium select-none" style={{ color: 'rgba(180,180,180,0.5)' }}>{ranks[rIdx]}</span></div>;
+              const ri = boardOrientation === 'white' ? i : 7 - i;
+              return <div key={i} className="flex-1 flex items-center justify-center"><span className="text-[10px] font-medium select-none" style={{ color: 'rgba(180,180,180,0.5)' }}>{RANKS[ri]}</span></div>;
             })}
           </div>
         )}
 
-        <div
-          ref={boardRef}
-          className="relative w-full aspect-square overflow-hidden cursor-pointer"
-          onContextMenu={handleContextMenu}
-          onMouseDown={handleBoardMouseDown}
-          onMouseUp={handleBoardMouseUp}
-          onPointerMove={handleBoardPointerMove}
-          onPointerUp={handleBoardPointerUp}
-          onClick={handleBackgroundClick}
-        >
+        {/* ── Board ── */}
+        <div ref={boardRef} className="relative w-full aspect-square overflow-hidden"
+          style={{ cursor: phase.current === 'dragging' ? 'grabbing' : 'default' }}
+          onContextMenu={onContextMenu} onMouseDown={onBgMouseDown} onMouseUp={onBgMouseUp}
+          onPointerMove={onPointerMove} onPointerUp={onPointerUp} onClick={onBgClick}>
+
           {/* Squares */}
           <div className="absolute inset-0 grid grid-cols-8 grid-rows-8" style={{ zIndex: Z.SQUARE }}>
             {Array.from({ length: 64 }).map((_, idx) => {
-              const rowIdx = Math.floor(idx / 8), colIdx = idx % 8;
-              const fIdx = boardOrientation === 'white' ? colIdx : 7 - colIdx;
-              const rIdx = boardOrientation === 'white' ? rowIdx : 7 - rowIdx;
-              const sq = (files[fIdx] + ranks[rIdx]) as Square;
-              const isLight = (colIdx + rowIdx) % 2 === 0;
-              const isLastMoveSrc = lastMove && lastMove.from === sq;
-              const isLastMoveDst = lastMove && lastMove.to === sq;
-              const isSelected = selectedSquare === sq;
-              const isCheck = checkedKingSquare === sq;
+              const ri = Math.floor(idx / 8), ci = idx % 8;
+              const fi = boardOrientation === 'white' ? ci : 7 - ci;
+              const rri = boardOrientation === 'white' ? ri : 7 - ri;
+              const sq = (FILES[fi] + RANKS[rri]) as Square;
+              const isLight = (ci + ri) % 2 === 0;
+              const isLM = lastMove && (lastMove.from === sq || lastMove.to === sq);
+              const isSel = selectedSquare === sq;
+              const isChk = checkedKing === sq;
               const isLegal = legalSet.current.has(sq);
-              const hasPiece = !!chess.get(sq);
+              const hasPc = !!chess.get(sq);
 
-              let highlight = '';
-              if (isCheck) highlight = 'rgba(255,0,0,0.4)';
-              else if (isLastMoveSrc || isLastMoveDst) highlight = 'rgba(255,255,50,0.3)';
-              else if (isSelected) highlight = `${OLIVE} 0.4)`;
+              let hl = '';
+              if (isChk) hl = 'rgba(255,0,0,0.4)';
+              else if (isLM) hl = 'rgba(255,255,50,0.3)';
+              else if (isSel) hl = `${OLIVE} 0.4)`;
 
               return (
-                <div key={idx} onClick={(e) => { e.stopPropagation(); handleSquareClick(sq); }}
-                  className="relative w-full h-full" style={{ backgroundColor: isLight ? themeColors.light : themeColors.dark }}>
-                  {highlight && <div className="absolute inset-0" style={{ backgroundColor: highlight, zIndex: Z.HIGHLIGHT, transition: 'background-color 70ms' }} />}
+                <div key={idx} onClick={(e) => { e.stopPropagation(); onSquareClick(sq); }}
+                  className="relative w-full h-full"
+                  style={{ backgroundColor: isLight ? themeColors.light : themeColors.dark }}>
+                  {hl && <div className="absolute inset-0" style={{ backgroundColor: hl, zIndex: Z.HIGHLIGHT, transition: `background-color ${SELECTION_MS}ms` }} />}
                   {isLegal && (
-                    <div className="absolute inset-0 pointer-events-none" style={{ zIndex: Z.HIGHLIGHT + 10, transition: 'opacity 100ms' }}>
-                      {hasPiece ? (
+                    <div className="absolute inset-0 pointer-events-none" style={{ zIndex: Z.LEGAL, transition: `opacity ${LEGAL_FADE_MS}ms` }}>
+                      {hasPc ? (
                         <div className="absolute inset-0 flex items-center justify-center">
                           <div style={{ width: '85%', height: '85%', borderRadius: '50%', border: `4px solid ${OLIVE} 0.7)`, boxSizing: 'border-box' }} />
                         </div>
@@ -532,38 +557,32 @@ export const ChessBoard: React.FC = () => {
             })}
           </div>
 
-          {/* Snap highlight (direct DOM updates, no re-render) */}
+          {/* Snap highlight (direct DOM) */}
           <div ref={snapHighlightRef} className="absolute pointer-events-none"
-            style={{ zIndex: Z.HIGHLIGHT + 5, opacity: 0, transition: 'left 50ms, top 50ms, opacity 50ms',
-              backgroundColor: 'rgba(255,255,255,0.13)' }} />
+            style={{ zIndex: Z.SNAP, width: '12.5%', height: '12.5%', opacity: 0, backgroundColor: 'rgba(255,255,255,0.13)',
+              transition: 'left 50ms, top 50ms, opacity 50ms' }} />
 
           {/* Pieces */}
           <div className="absolute inset-0 pointer-events-none" style={{ zIndex: Z.PIECE }}>
             <AnimatePresence>
               {pieces.map((piece) => {
-                const { x, y } = getSquareCoordinates(piece.square);
-                const isHidden = draggingPiece?.id === piece.id && dragActive.current;
+                const { x, y } = getCoords(piece.square);
+                const hidden = dragSource === piece.square && isDragging;
 
                 return (
-                  <motion.div
-                    key={piece.id}
+                  <motion.div key={piece.id}
                     layoutId={reducedMotion ? undefined : piece.id}
-                    transition={{
-                      duration: isHidden ? 0 : effectiveDuration,
-                      ease: isHidden ? undefined : MOVE_EASE,
-                    }}
+                    transition={{ duration: hidden ? 0 : moveDuration, ease: hidden ? undefined : MOVE_EASE }}
                     className="absolute pointer-events-auto"
                     style={{
                       width: '12.5%', height: '12.5%',
                       top: `${y * 12.5}%`, left: `${x * 12.5}%`,
-                      x: 0, y: 0,
-                      zIndex: Z.PIECE,
-                      opacity: isHidden ? 0 : 1,
-                      cursor: 'grab',
+                      x: 0, y: 0, zIndex: Z.PIECE,
+                      opacity: hidden ? 0 : 1,
+                      cursor: phase.current === 'dragging' ? 'grabbing' : 'grab',
                     }}
-                    whileHover={!draggingPiece ? { scale: 1.02, transition: { duration: 0.08 } } : undefined}
-                    onPointerDown={(e) => handlePiecePointerDown(e, piece)}
-                  >
+                    whileHover={phase.current === 'idle' ? { scale: 1.02, transition: { duration: HOVER_MS } } : undefined}
+                    onPointerDown={(e) => onPiecePointerDown(e, piece)}>
                     <img src={`./assets/pieces/${piece.color}${piece.type.toUpperCase()}.svg`}
                       alt={`${piece.color}${piece.type}`}
                       className="w-full h-full select-none pointer-events-none" draggable={false} />
@@ -573,54 +592,37 @@ export const ChessBoard: React.FC = () => {
             </AnimatePresence>
           </div>
 
-          {/* SVG: Arrows & Highlights */}
+          {/* Arrows & Highlights */}
           <svg className="absolute inset-0 w-full h-full pointer-events-none fill-none" style={{ zIndex: Z.ARROW }} viewBox="0 0 100 100">
             <defs>
-              <marker id="arrowhead" markerWidth="5" markerHeight="5" refX="1.5" refY="2.5" orient="auto" markerUnits="strokeWidth">
+              <marker id="ah" markerWidth="5" markerHeight="5" refX="1.5" refY="2.5" orient="auto" markerUnits="strokeWidth">
                 <path d="M0,0.5 L5,2.5 L0,4.5 Q1.5,2.5 0,0.5 Z" fill={`${OLIVE} 0.8)`} />
               </marker>
             </defs>
             {storeCircles.map((c, i) => {
-              const coords = getSquareCoordinates(c.square as Square);
-              const color = c.color === 'red' ? 'rgba(255,0,0,0.35)' : c.color === 'yellow' ? 'rgba(255,255,0,0.35)' : c.color === 'blue' ? 'rgba(0,100,255,0.35)' : 'rgba(98,113,53,0.35)';
-              return <rect key={`sq-${i}`} x={coords.x * 12.5} y={coords.y * 12.5} width="12.5" height="12.5" fill={color} />;
+              const co = getCoords(c.square as Square);
+              const col = c.color === 'red' ? 'rgba(255,0,0,0.35)' : c.color === 'yellow' ? 'rgba(255,255,0,0.35)' : c.color === 'blue' ? 'rgba(0,100,255,0.35)' : 'rgba(98,113,53,0.35)';
+              return <rect key={`sq${i}`} x={co.x * 12.5} y={co.y * 12.5} width="12.5" height="12.5" fill={col} />;
             })}
-            {storeArrows.map((a, i) => {
-              const { x1, y1, x2, y2 } = getArrowCoords(a);
-              return <line key={`a-${i}`} x1={x1} y1={y1} x2={x2} y2={y2} stroke={`${OLIVE} 0.8)`} strokeWidth="1.2" strokeLinecap="round" markerEnd="url(#arrowhead)" style={{ transition: 'opacity 120ms' }} />;
-            })}
-            {arrowPreview && (() => {
-              const { x1, y1, x2, y2 } = getArrowCoords(arrowPreview);
-              return <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={`${OLIVE} 0.6)`} strokeWidth="1" strokeLinecap="round" markerEnd="url(#arrowhead)" />;
-            })()}
+            {storeArrows.map((a, i) => { const { x1, y1, x2, y2 } = arrowCoords(a); return <line key={`a${i}`} x1={x1} y1={y1} x2={x2} y2={y2} stroke={`${OLIVE} 0.8)`} strokeWidth="1.2" strokeLinecap="round" markerEnd="url(#ah)" />; })}
           </svg>
 
           {/* Promotion */}
           {promotionPending && (() => {
             const color = chess.turn();
-            const options: ('q' | 'r' | 'b' | 'n')[] = ['q', 'r', 'b', 'n'];
-            const coords = getSquareCoordinates(promotionPending.to);
-            const isTop = promotionPending.to[1] === '8';
+            const opts: ('q' | 'r' | 'b' | 'n')[] = ['q', 'r', 'b', 'n'];
+            const co = getCoords(promotionPending.to);
+            const top = promotionPending.to[1] === '8';
             return (
               <div className="absolute inset-0" style={{ zIndex: Z.PROMO }} onClick={(e) => { e.stopPropagation(); setPromotionPending(null); }}>
-                <motion.div
-                  initial={{ opacity: 0, scale: 0.95 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  transition={{ duration: 0.08, ease: 'easeOut' }}
+                <motion.div initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} transition={{ duration: PROMO_MS, ease: 'easeOut' }}
                   className="absolute flex flex-col rounded-md overflow-hidden shadow-xl"
-                  style={{
-                    top: isTop ? `${coords.y * 12.5 - 50}%` : `${(coords.y + 1) * 12.5}%`,
-                    left: `${coords.x * 12.5}%`, width: '12.5%',
-                    background: '#1a1816', border: '1px solid rgba(255,255,255,0.1)',
-                  }}
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  {options.map((opt) => (
-                    <button key={opt}
-                      onClick={() => { sound.playPromotion(); executeMove(promotionPending.from, promotionPending.to, opt); }}
-                      className="hover:bg-white/15 transition-colors cursor-pointer p-1 flex items-center justify-center"
-                      style={{ aspectRatio: '1' }}>
-                      <img src={`./assets/pieces/${color}${opt.toUpperCase()}.svg`} alt={opt} className="w-full h-full" />
+                  style={{ top: top ? `${co.y * 12.5 - 50}%` : `${(co.y + 1) * 12.5}%`, left: `${co.x * 12.5}%`, width: '12.5%', background: '#1a1816', border: '1px solid rgba(255,255,255,0.1)' }}
+                  onClick={(e) => e.stopPropagation()}>
+                  {opts.map((o) => (
+                    <button key={o} onClick={() => { sound.playPromotion(); executeMove(promotionPending.from, promotionPending.to, o); }}
+                      className="hover:bg-white/15 transition-colors cursor-pointer p-1 flex items-center justify-center" style={{ aspectRatio: '1' }}>
+                      <img src={`./assets/pieces/${color}${o.toUpperCase()}.svg`} alt={o} className="w-full h-full" />
                     </button>
                   ))}
                 </motion.div>
@@ -629,21 +631,23 @@ export const ChessBoard: React.FC = () => {
           })()}
         </div>
 
+        {/* ── Coordinates: Right ── */}
         {showCoordinates && (
           <div className="flex flex-col w-5 ml-0.5" style={{ aspectRatio: '1/8' }}>
             {Array.from({ length: 8 }).map((_, i) => {
-              const rIdx = boardOrientation === 'white' ? i : 7 - i;
-              return <div key={i} className="flex-1 flex items-center justify-center"><span className="text-[10px] font-medium select-none" style={{ color: 'rgba(180,180,180,0.5)' }}>{ranks[rIdx]}</span></div>;
+              const ri = boardOrientation === 'white' ? i : 7 - i;
+              return <div key={i} className="flex-1 flex items-center justify-center"><span className="text-[10px] font-medium select-none" style={{ color: 'rgba(180,180,180,0.5)' }}>{RANKS[ri]}</span></div>;
             })}
           </div>
         )}
       </div>
 
+      {/* ── Coordinates: Bottom ── */}
       {showCoordinates && (
         <div className="flex w-full mt-0.5">
           {Array.from({ length: 8 }).map((_, i) => {
-            const fIdx = boardOrientation === 'white' ? i : 7 - i;
-            return <div key={i} className="flex-1 text-center"><span className="text-[10px] font-medium select-none" style={{ color: 'rgba(180,180,180,0.5)' }}>{files[fIdx]}</span></div>;
+            const fi = boardOrientation === 'white' ? i : 7 - i;
+            return <div key={i} className="flex-1 text-center"><span className="text-[10px] font-medium select-none" style={{ color: 'rgba(180,180,180,0.5)' }}>{FILES[fi]}</span></div>;
           })}
         </div>
       )}
